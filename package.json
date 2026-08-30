@@ -1,0 +1,43 @@
+{
+  "name": "coding-agent",
+  "version": "0.1.0",
+  "description": "A build-to-learn, read-only-first coding agent for the terminal.",
+  "type": "module",
+  "bin": {
+    "coding-agent": "dist/cli.js"
+  },
+  "scripts": {
+    "clean": "node -e \"import('node:fs').then(({rmSync}) => rmSync('dist', {recursive: true, force: true}))\"",
+    "build": "npm run clean && tsc -p tsconfig.json",
+    "dev": "tsx src/cli.tsx",
+    "start": "node dist/cli.js",
+    "test": "vitest",
+    "test:run": "vitest run",
+    "typecheck": "tsc -p tsconfig.check.json",
+    "smoke:real": "tsx scripts/real-smoke.ts",
+    "verify": "npm run typecheck && npm run test:run && npm run build"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/destire-mio/coding-agent.git"
+  },
+  "license": "MIT",
+  "engines": {
+    "node": ">=22"
+  },
+  "dependencies": {
+    "ink": "^7.1.1",
+    "ink-text-input": "^6.0.0",
+    "openai": "^7.8.0",
+    "react": "^19.2.8",
+    "zod": "^4.5.4"
+  },
+  "devDependencies": {
+    "@types/node": "^26.4.0",
+    "@types/react": "^19.2.18",
+    "ink-testing-library": "^4.0.0",
+    "tsx": "^4.23.13",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11"
+  }
+}

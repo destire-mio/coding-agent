@@ -1,0 +1,121 @@
+export interface ToolCall {
+  readonly id: string;
+  readonly name: string;
+  readonly rawArguments: string;
+}
+
+export interface ToolDefinition {
+  readonly name: string;
+  readonly description: string;
+  readonly inputSchema: Record<string, unknown>;
+}
+
+export interface ToolError {
+  readonly code: string;
+  readonly message: string;
+  readonly retryable: boolean;
+}
+
+export type Observation =
+  | {
+      readonly toolCallId: string;
+      readonly toolName: string;
+      readonly status: "success";
+      readonly output: unknown;
+    }
+  | {
+      readonly toolCallId: string;
+      readonly toolName: string;
+      readonly status: "error";
+      readonly error: ToolError;
+    };
+
+export type AgentMessage =
+  | {
+      readonly role: "user";
+      readonly content: string;
+    }
+  | {
+      readonly role: "assistant";
+      readonly content: string;
+      readonly toolCalls: readonly ToolCall[];
+    }
+  | {
+      readonly role: "tool";
+      readonly toolCallId: string;
+      readonly toolName: string;
+      readonly observation: Observation;
+    };
+
+export interface ModelRequest {
+  readonly systemPrompt: string;
+  readonly messages: readonly AgentMessage[];
+  readonly tools: readonly ToolDefinition[];
+}
+
+export type ModelResponse =
+  | {
+      readonly kind: "final";
+      readonly text: string;
+    }
+  | {
+      readonly kind: "tool_calls";
+      readonly content: string;
+      readonly calls: readonly ToolCall[];
+    };
+
+export interface ModelProvider {
+  complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse>;
+}
+
+export interface ToolExecutor {
+  definitions(): readonly ToolDefinition[];
+  execute(call: ToolCall): Promise<Observation>;
+}
+
+export type RunEvent =
+  | { readonly type: "model_request"; readonly step: number }
+  | { readonly type: "tool_call"; readonly step: number; readonly call: ToolCall }
+  | {
+      readonly type: "observation";
+      readonly step: number;
+      readonly observation: Observation;
+    }
+  | { readonly type: "final_answer"; readonly step: number; readonly answer: string }
+  | { readonly type: "stopped"; readonly steps: number; readonly reason: "max_steps" }
+  | {
+      readonly type: "failed";
+      readonly steps: number;
+      readonly reason: RunFailureReason;
+      readonly message: string;
+    };
+
+export type RunFailureReason =
+  | "invalid_user_input"
+  | "provider_error"
+  | "invalid_model_response"
+  | "runtime_error";
+
+interface RunEvidence {
+  readonly steps: number;
+  readonly messages: readonly AgentMessage[];
+}
+
+export type RunResult =
+  | (RunEvidence & {
+      readonly kind: "final_answer";
+      readonly answer: string;
+    })
+  | (RunEvidence & {
+      readonly kind: "stopped";
+      readonly reason: "max_steps";
+    })
+  | (RunEvidence & {
+      readonly kind: "failed";
+      readonly reason: RunFailureReason;
+      readonly message: string;
+    });
+
+export function observationToModelContent(observation: Observation): string {
+  return JSON.stringify(observation);
+}
