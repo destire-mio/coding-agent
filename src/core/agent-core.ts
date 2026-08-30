@@ -1,5 +1,6 @@
 import type {
   AgentMessage,
+  ModelStreamEvent,
   ModelProvider,
   Observation,
   RunEvent,
@@ -69,13 +70,39 @@ export class AgentCore {
 
       let response;
       try {
+        const onModelEvent =
+          options.onEvent === undefined
+            ? undefined
+            : (event: ModelStreamEvent) => {
+                if (event.type === "text_delta") {
+                  this.#emit(options.onEvent, {
+                    type: "model_text_delta",
+                    step,
+                    delta: event.delta,
+                  });
+                  return;
+                }
+                this.#emit(options.onEvent, {
+                  type: "model_tool_call_delta",
+                  step,
+                  index: event.index,
+                  ...(event.id === undefined ? {} : { id: event.id }),
+                  ...(event.name === undefined ? {} : { name: event.name }),
+                  ...(event.argumentsDelta === undefined
+                    ? {}
+                    : { argumentsDelta: event.argumentsDelta }),
+                });
+              };
         response = await this.#provider.complete(
           {
             systemPrompt: this.#systemPrompt,
             messages: [...messages],
             tools: this.#runtime.definitions(),
           },
-          options.signal,
+          {
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+            ...(onModelEvent === undefined ? {} : { onEvent: onModelEvent }),
+          },
         );
       } catch {
         return this.#failed(

@@ -33,6 +33,7 @@ describe("DeepSeek Chat Completions request", () => {
     expect(body).toMatchObject({
       model: "deepseek-v4-flash",
       tool_choice: "auto",
+      stream: true,
       thinking: { type: "disabled" },
     });
     expect(body.tools?.[0]).toMatchObject({

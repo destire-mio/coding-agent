@@ -5,11 +5,22 @@ import TextInput from "ink-text-input";
 import type { AgentCore } from "../core/agent-core.js";
 import type { RunEvent, RunResult } from "../core/contracts.js";
 
+const STREAMING_UI_FLUSH_MS = 50;
+const STREAMING_TEXT_PREVIEW_MAX_CHARS = 480;
+const STREAMING_TOOL_PREVIEW_MAX_CHARS = 1_024;
+
 export interface AgentAppProps {
   readonly core: AgentCore;
   readonly workspace: string;
   readonly initialPrompt?: string;
   readonly onComplete?: (result: RunResult) => void;
+}
+
+interface StreamingToolDraft {
+  readonly index: number;
+  readonly id: string;
+  readonly name: string;
+  readonly argumentsText: string;
 }
 
 export function AgentApp({
@@ -22,8 +33,25 @@ export function AgentApp({
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [running, setRunning] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
+  const [streamingText, setStreamingText] = useState("");
+  const [streamingToolDrafts, setStreamingToolDrafts] = useState<
+    StreamingToolDraft[]
+  >([]);
+  const pendingStreamingText = useRef("");
+  const textFlushTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
   const [result, setResult] = useState<RunResult>();
   const autoStarted = useRef(false);
+
+  const clearStreamingText = useCallback(() => {
+    pendingStreamingText.current = "";
+    if (textFlushTimer.current !== undefined) {
+      clearTimeout(textFlushTimer.current);
+      textFlushTimer.current = undefined;
+    }
+    setStreamingText("");
+  }, []);
 
   const submit = useCallback(
     async (value: string) => {
@@ -33,16 +61,50 @@ export function AgentApp({
 
       setRunning(true);
       setEvents([]);
+      clearStreamingText();
+      setStreamingToolDrafts([]);
       const nextResult = await core.run(value, {
         onEvent: (event) => {
-          setEvents((current) => [...current, describeEvent(event)]);
+          if (event.type === "model_request") {
+            clearStreamingText();
+            setStreamingToolDrafts([]);
+          } else if (event.type === "model_text_delta") {
+            pendingStreamingText.current = (
+              pendingStreamingText.current + event.delta
+            ).slice(-STREAMING_TEXT_PREVIEW_MAX_CHARS);
+            if (textFlushTimer.current === undefined) {
+              textFlushTimer.current = setTimeout(() => {
+                textFlushTimer.current = undefined;
+                setStreamingText(pendingStreamingText.current);
+              }, STREAMING_UI_FLUSH_MS);
+            }
+            return;
+          } else if (event.type === "model_tool_call_delta") {
+            setStreamingToolDrafts((current) =>
+              mergeToolCallDelta(current, event),
+            );
+            return;
+          } else if (
+            event.type === "tool_call" ||
+            event.type === "final_answer" ||
+            event.type === "stopped" ||
+            event.type === "failed"
+          ) {
+            clearStreamingText();
+            setStreamingToolDrafts([]);
+          }
+
+          const description = describeEvent(event);
+          if (description !== undefined) {
+            setEvents((current) => [...current, description]);
+          }
         },
       });
       setResult(nextResult);
       setRunning(false);
       onComplete?.(nextResult);
     },
-    [core, onComplete, running],
+    [clearStreamingText, core, onComplete, running],
   );
 
   useEffect(() => {
@@ -57,6 +119,15 @@ export function AgentApp({
       exit();
     }
   }, [exit, result]);
+
+  useEffect(
+    () => () => {
+      if (textFlushTimer.current !== undefined) {
+        clearTimeout(textFlushTimer.current);
+      }
+    },
+    [],
+  );
 
   return (
     <Box flexDirection="column" paddingX={1}>
@@ -73,6 +144,15 @@ export function AgentApp({
       ) : null}
 
       {running ? <Text color="yellow">running…</Text> : null}
+      {streamingText.length > 0 ? (
+        <Text dimColor>stream › {streamingText}</Text>
+      ) : null}
+      {streamingToolDrafts.map((draft) => (
+        <Text key={draft.index} dimColor>
+          draft {draft.name || "tool"} ({draft.id || `#${draft.index}`}) ›{" "}
+          {draft.argumentsText || "…"}
+        </Text>
+      ))}
       {events.map((event, index) => (
         <Text key={`${index}:${event}`}>{event}</Text>
       ))}
@@ -97,10 +177,39 @@ export function AgentApp({
   );
 }
 
-function describeEvent(event: RunEvent): string {
+function mergeToolCallDelta(
+  current: readonly StreamingToolDraft[],
+  event: Extract<RunEvent, { type: "model_tool_call_delta" }>,
+): StreamingToolDraft[] {
+  const previous = current.find((draft) => draft.index === event.index) ?? {
+    index: event.index,
+    id: "",
+    name: "",
+    argumentsText: "",
+  };
+  const next: StreamingToolDraft = {
+    index: event.index,
+    id: event.id ?? previous.id,
+    name: event.name ?? previous.name,
+    argumentsText:
+      previous.argumentsText + (event.argumentsDelta ?? ""),
+  };
+  const boundedNext = {
+    ...next,
+    argumentsText: next.argumentsText.slice(-STREAMING_TOOL_PREVIEW_MAX_CHARS),
+  };
+  return [...current.filter((draft) => draft.index !== event.index), boundedNext].sort(
+    (left, right) => left.index - right.index,
+  );
+}
+
+function describeEvent(event: RunEvent): string | undefined {
   switch (event.type) {
     case "model_request":
       return `step ${event.step}: model request`;
+    case "model_text_delta":
+    case "model_tool_call_delta":
+      return undefined;
     case "tool_call":
       return `step ${event.step}: tool call ${event.call.name} (${event.call.id})`;
     case "observation":

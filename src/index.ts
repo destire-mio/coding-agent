@@ -1,9 +1,11 @@
 export { AgentCore } from "./core/agent-core.js";
 export type {
   AgentMessage,
+  ModelCompletionOptions,
   ModelProvider,
   ModelRequest,
   ModelResponse,
+  ModelStreamEvent,
   Observation,
   RunEvent,
   RunResult,

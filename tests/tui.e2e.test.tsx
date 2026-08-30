@@ -6,6 +6,7 @@ import { render } from "ink-testing-library";
 
 import { AgentCore } from "../src/core/agent-core.js";
 import type {
+  ModelCompletionOptions,
   ModelProvider,
   ModelRequest,
   ModelResponse,
@@ -29,7 +30,7 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   await mkdir(workspace);
   await writeFile(join(workspace, "README.md"), "TUI_E2E_MARKER\n", "utf8");
 
-  const provider = new ScriptedProvider([
+  const provider = new StreamingScriptedProvider([
     {
       kind: "tool_calls",
       content: "",
@@ -67,10 +68,20 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   expect(view.lastFrame()).toContain("tool call read (call-tui-read)");
   expect(view.lastFrame()).toContain("observation success (call-tui-read)");
   expect(view.lastFrame()).toContain("The README contains TUI_E2E_MARKER.");
+  expect(
+    view.frames.some((frame) =>
+      frame.includes('draft read (call-tui-read) › {"path":"READ'),
+    ),
+  ).toBe(true);
+  expect(
+    view.frames.some((frame) =>
+      frame.includes("stream › The README contains TUI_E2E_MARKER."),
+    ),
+  ).toBe(true);
   view.unmount();
 });
 
-class ScriptedProvider implements ModelProvider {
+class StreamingScriptedProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
   readonly #responses: ModelResponse[];
 
@@ -78,12 +89,42 @@ class ScriptedProvider implements ModelProvider {
     this.#responses = [...responses];
   }
 
-  async complete(request: ModelRequest): Promise<ModelResponse> {
+  async complete(
+    request: ModelRequest,
+    options?: ModelCompletionOptions,
+  ): Promise<ModelResponse> {
     this.requests.push(request);
     const response = this.#responses.shift();
     if (response === undefined) {
       throw new Error("No scripted response remains");
     }
+    if (response.kind === "tool_calls") {
+      const call = response.calls[0];
+      if (call !== undefined) {
+        const splitAt = Math.max(1, Math.floor(call.rawArguments.length / 2));
+        options?.onEvent?.({
+          type: "tool_call_delta",
+          index: 0,
+          id: call.id,
+          name: call.name,
+          argumentsDelta: call.rawArguments.slice(0, splitAt),
+        });
+        await renderTurn();
+        options?.onEvent?.({
+          type: "tool_call_delta",
+          index: 0,
+          argumentsDelta: call.rawArguments.slice(splitAt),
+        });
+        await renderTurn();
+      }
+    } else {
+      options?.onEvent?.({ type: "text_delta", delta: response.text });
+      await renderTurn(75);
+    }
     return response;
   }
+}
+
+async function renderTurn(delayMs = 10): Promise<void> {
+  await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
 }

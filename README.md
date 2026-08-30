@@ -83,6 +83,19 @@ Expected tool failures such as invalid arguments, missing files, and permission
 denials are returned to the model as error Observations. Provider or Core failures
 terminate the run instead.
 
+## Streaming boundary
+
+Provider stream fragments are drafts, not executable tool calls. The Adapter
+normalizes text and tool-call deltas for the TUI, assembles tool arguments, and
+only returns a `ToolCall` after the provider cleanly finishes with
+`finish_reason: "tool_calls"`. If the stream disconnects, ends without a finish
+reason, or finishes because of truncation, Core returns a Provider failure and
+Tool Runtime is not called.
+
+The TUI coalesces draft updates every 50 ms and keeps a bounded preview, while
+the Adapter preserves the complete response used by Core. This keeps rendering
+responsive without weakening the execution gate.
+
 ## Verify
 
 ```bash
@@ -96,6 +109,10 @@ The deterministic suite covers:
 - malformed arguments and missing files;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
+- streamed text and fragmented tool arguments being assembled correctly;
+- interrupted or truncated streams producing a Provider failure with zero tool
+  executions;
+- TUI draft frames for streamed text and tool arguments;
 - a clean TypeScript build and executable CLI entry point.
 
 The real-provider smoke is separate because it spends provider quota and requires
@@ -106,8 +123,17 @@ node --env-file=.env --import tsx scripts/real-smoke.ts
 ```
 
 It creates a temporary workspace, requires the real model to call Read, verifies
-the matching Observation, and checks that the final answer contains a marker read
-from the file.
+the matching Observation, checks that both tool-call and text stream deltas were
+received, and checks that the final answer contains a marker read from the file.
+
+## Design reference
+
+The streaming split was checked against Kimi Code at pinned commit
+[`56b5480`](https://github.com/MoonshotAI/kimi-code/tree/56b5480ed0da2274f062cd9a38a281187cbe8c36).
+This project adopts provider-neutral deltas, the no-partial-execution gate, and
+50 ms TUI coalescing. It deliberately does not yet persist interrupted turns or
+write a synthetic unexecuted tool result; those belong to the later Session and
+recovery milestones.
 
 ## Current security boundary
 
@@ -124,12 +150,13 @@ from the file.
 
 ## Status
 
-The mechanical implementation and deterministic tests exist locally. On
-2026-08-30, the real-provider smoke passed with DeepSeek in two model rounds:
-the first round produced a Read call, Runtime returned a successful matching
-Observation, and the second round returned a final answer containing the file's
-private marker. The compiled TUI also completed the real README task and showed
-`tool call read → observation success → final answer` before exiting normally.
+On 2026-08-30, the deterministic suite passed 20 tests across 6 test files. The
+real-provider smoke passed with DeepSeek in two model rounds: streamed tool-call
+arguments were assembled into Read, Runtime returned a successful matching
+Observation, and streamed final text contained the file's private marker. The
+compiled TUI also completed the real README task, displayed bounded streaming
+drafts plus `tool call read → observation success → final answer`, and exited
+normally.
 
 This proves the current minimum chain runs; it does not yet prove the later
 production-strength Provider, sandbox, Session, or recovery milestones.

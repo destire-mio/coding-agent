@@ -5,9 +5,11 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentCore } from "../src/core/agent-core.js";
 import type {
+  ModelCompletionOptions,
   ModelProvider,
   ModelRequest,
   ModelResponse,
+  ToolExecutor,
 } from "../src/core/contracts.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
@@ -124,6 +126,49 @@ describe("read-only ReAct end-to-end", () => {
     const result = await core.run("读取 README.md");
 
     expect(result).toMatchObject({ kind: "failed", reason: "provider_error", steps: 1 });
+  });
+
+  it("never executes a partial streamed ToolCall after provider failure", async () => {
+    let executions = 0;
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async (call) => {
+        executions += 1;
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "success",
+          output: "must not run",
+        };
+      },
+    };
+    const provider: ModelProvider = {
+      complete: async (
+        _request: ModelRequest,
+        options?: ModelCompletionOptions,
+      ) => {
+        options?.onEvent?.({
+          type: "tool_call_delta",
+          index: 0,
+          id: "call-partial",
+          name: "read",
+          argumentsDelta: '{"path":"READ',
+        });
+        throw new Error("provider stream disconnected");
+      },
+    };
+    const core = new AgentCore(provider, runtime);
+    const eventTypes: string[] = [];
+
+    const result = await core.run("读取 README.md", {
+      onEvent: (event) => eventTypes.push(event.type),
+    });
+
+    expect(result).toMatchObject({ kind: "failed", reason: "provider_error", steps: 1 });
+    expect(executions).toBe(0);
+    expect(eventTypes).toContain("model_tool_call_delta");
+    expect(eventTypes).not.toContain("tool_call");
+    expect(eventTypes).not.toContain("observation");
   });
 });
 

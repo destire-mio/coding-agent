@@ -64,8 +64,29 @@ export type ModelResponse =
       readonly calls: readonly ToolCall[];
     };
 
+export type ModelStreamEvent =
+  | {
+      readonly type: "text_delta";
+      readonly delta: string;
+    }
+  | {
+      readonly type: "tool_call_delta";
+      readonly index: number;
+      readonly id?: string;
+      readonly name?: string;
+      readonly argumentsDelta?: string;
+    };
+
+export interface ModelCompletionOptions {
+  readonly signal?: AbortSignal;
+  readonly onEvent?: (event: ModelStreamEvent) => void;
+}
+
 export interface ModelProvider {
-  complete(request: ModelRequest, signal?: AbortSignal): Promise<ModelResponse>;
+  complete(
+    request: ModelRequest,
+    options?: ModelCompletionOptions,
+  ): Promise<ModelResponse>;
 }
 
 export interface ToolExecutor {
@@ -75,6 +96,19 @@ export interface ToolExecutor {
 
 export type RunEvent =
   | { readonly type: "model_request"; readonly step: number }
+  | {
+      readonly type: "model_text_delta";
+      readonly step: number;
+      readonly delta: string;
+    }
+  | {
+      readonly type: "model_tool_call_delta";
+      readonly step: number;
+      readonly index: number;
+      readonly id?: string;
+      readonly name?: string;
+      readonly argumentsDelta?: string;
+    }
   | { readonly type: "tool_call"; readonly step: number; readonly call: ToolCall }
   | {
       readonly type: "observation";

@@ -20,8 +20,16 @@ try {
   const provider = new OpenAICompatibleProvider(loadProviderConfig());
   const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
   const core = new AgentCore(provider, runtime, { maxSteps: 4 });
+  let sawToolCallDelta = false;
+  let sawTextDelta = false;
   const result = await core.run(
     "Use the read tool to read README.md, summarize it, and include its exact marker.",
+    {
+      onEvent: (event) => {
+        sawToolCallDelta ||= event.type === "model_tool_call_delta";
+        sawTextDelta ||= event.type === "model_text_delta";
+      },
+    },
   );
 
   const readObservation = result.messages.find(
@@ -40,6 +48,9 @@ try {
   if (!result.answer.includes(marker)) {
     throw new Error("The final answer did not preserve the README verification marker.");
   }
+  if (!sawToolCallDelta || !sawTextDelta) {
+    throw new Error("The real provider did not expose both tool and text stream deltas.");
+  }
 
   process.stdout.write(
     `${JSON.stringify(
@@ -48,6 +59,7 @@ try {
         steps: result.steps,
         tool: "read",
         markerVerified: true,
+        streamingVerified: true,
         answer: result.answer,
       },
       null,

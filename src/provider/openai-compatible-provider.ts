@@ -2,9 +2,12 @@ import OpenAI from "openai";
 
 import type {
   AgentMessage,
+  ModelCompletionOptions,
   ModelProvider,
   ModelRequest,
   ModelResponse,
+  ModelStreamEvent,
+  ToolCall,
 } from "../core/contracts.js";
 import { observationToModelContent } from "../core/contracts.js";
 import type { ProviderConfig } from "./config.js";
@@ -20,43 +23,155 @@ export class OpenAICompatibleProvider implements ModelProvider {
 
   async complete(
     request: ModelRequest,
-    signal?: AbortSignal,
+    options: ModelCompletionOptions = {},
   ): Promise<ModelResponse> {
-    const response = await this.#client.chat.completions.create(
+    const stream = await this.#client.chat.completions.create(
       buildChatCompletionRequest(this.#config, request),
-      signal === undefined ? undefined : { signal },
+      options.signal === undefined ? undefined : { signal: options.signal },
     );
 
-    const message = response.choices[0]?.message;
-    if (message === undefined) {
-      throw new Error("The provider returned no response choice.");
-    }
+    return consumeChatCompletionStream(stream, options.onEvent);
+  }
+}
 
-    const toolCalls = (message.tool_calls ?? []).map((call) => {
-      if (call.type !== "function") {
-        throw new Error("The provider returned an unsupported tool call type.");
+interface BufferedToolCall {
+  readonly index: number;
+  id?: string;
+  name?: string;
+  rawArguments: string;
+}
+
+export async function consumeChatCompletionStream(
+  stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>,
+  onEvent?: (event: ModelStreamEvent) => void,
+): Promise<ModelResponse> {
+  let content = "";
+  let finishReason: string | undefined;
+  const toolCallsByIndex = new Map<number, BufferedToolCall>();
+
+  for await (const chunk of stream) {
+    for (const choice of chunk.choices) {
+      if (choice.index !== 0) {
+        throw new Error("The provider returned an unsupported extra choice.");
       }
-      return {
-        id: call.id,
-        name: call.function.name,
-        rawArguments: call.function.arguments,
-      };
-    });
 
-    if (toolCalls.length > 0) {
-      return {
-        kind: "tool_calls",
-        content: message.content ?? "",
-        calls: toolCalls,
-      };
+      if (choice.finish_reason !== null) {
+        if (
+          finishReason !== undefined &&
+          finishReason !== choice.finish_reason
+        ) {
+          throw new Error("The provider returned conflicting finish reasons.");
+        }
+        finishReason = choice.finish_reason;
+      }
+
+      const textDelta = choice.delta.content;
+      if (textDelta !== undefined && textDelta !== null && textDelta.length > 0) {
+        content += textDelta;
+        emitStreamEvent(onEvent, { type: "text_delta", delta: textDelta });
+      }
+
+      for (const toolCallDelta of choice.delta.tool_calls ?? []) {
+        if (
+          (toolCallDelta.type !== undefined && toolCallDelta.type !== "function") ||
+          toolCallDelta.custom !== undefined
+        ) {
+          throw new Error("The provider returned an unsupported tool call type.");
+        }
+
+        const buffer = toolCallsByIndex.get(toolCallDelta.index) ?? {
+          index: toolCallDelta.index,
+          rawArguments: "",
+        };
+        const id = toolCallDelta.id;
+        const name = toolCallDelta.function?.name;
+        const argumentsDelta = toolCallDelta.function?.arguments;
+
+        if (id !== undefined) {
+          if (buffer.id !== undefined && buffer.id !== id) {
+            throw new Error("The provider changed a streamed tool call identity.");
+          }
+          buffer.id = id;
+        }
+        if (name !== undefined && name.length > 0) {
+          if (buffer.name !== undefined && buffer.name !== name) {
+            throw new Error("The provider changed a streamed tool name.");
+          }
+          buffer.name = name;
+        }
+        if (argumentsDelta !== undefined) {
+          buffer.rawArguments += argumentsDelta;
+        }
+        toolCallsByIndex.set(toolCallDelta.index, buffer);
+
+        emitStreamEvent(onEvent, {
+          type: "tool_call_delta",
+          index: toolCallDelta.index,
+          ...(id === undefined ? {} : { id }),
+          ...(name === undefined ? {} : { name }),
+          ...(argumentsDelta === undefined ? {} : { argumentsDelta }),
+        });
+      }
+    }
+  }
+
+  if (finishReason === undefined) {
+    throw new Error("The provider stream ended without a finish reason.");
+  }
+
+  if (finishReason === "tool_calls") {
+    if (toolCallsByIndex.size === 0) {
+      throw new Error("The provider finished with tool_calls but returned no calls.");
     }
 
-    return { kind: "final", text: message.content ?? "" };
+    const calls: ToolCall[] = [...toolCallsByIndex.values()]
+      .sort((left, right) => left.index - right.index)
+      .map((call) => {
+        if (
+          call.id === undefined ||
+          call.id.trim().length === 0 ||
+          call.name === undefined ||
+          call.name.trim().length === 0
+        ) {
+          throw new Error("The provider returned an incomplete streamed tool call.");
+        }
+        return {
+          id: call.id,
+          name: call.name,
+          rawArguments: call.rawArguments,
+        };
+      });
+
+    return { kind: "tool_calls", content, calls };
+  }
+
+  if (finishReason !== "stop") {
+    throw new Error(`The provider stream did not complete safely: ${finishReason}.`);
+  }
+
+  if (toolCallsByIndex.size > 0) {
+    throw new Error("The provider stopped normally with unfinished tool calls.");
+  }
+
+  return { kind: "final", text: content };
+}
+
+function emitStreamEvent(
+  onEvent: ((event: ModelStreamEvent) => void) | undefined,
+  event: ModelStreamEvent,
+): void {
+  if (onEvent === undefined) {
+    return;
+  }
+  try {
+    onEvent(event);
+  } catch {
+    // Progress observers such as the TUI cannot change provider semantics.
   }
 }
 
 type CompatibleChatCompletionRequest =
-  OpenAI.Chat.Completions.ChatCompletionCreateParamsNonStreaming & {
+  OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
     readonly thinking: { readonly type: "disabled" };
   };
 
@@ -79,6 +194,7 @@ export function buildChatCompletionRequest(
       },
     })),
     tool_choice: "auto",
+    stream: true,
     thinking: { type: config.thinking },
   };
 }
