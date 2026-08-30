@@ -65,7 +65,10 @@ export function AgentApp({
       setStreamingToolDrafts([]);
       const nextResult = await core.run(value, {
         onEvent: (event) => {
-          if (event.type === "model_request") {
+          if (
+            event.type === "model_request" ||
+            event.type === "provider_retry"
+          ) {
             clearStreamingText();
             setStreamingToolDrafts([]);
           } else if (event.type === "model_text_delta") {
@@ -206,10 +209,12 @@ function mergeToolCallDelta(
 function describeEvent(event: RunEvent): string | undefined {
   switch (event.type) {
     case "model_request":
-      return `step ${event.step}: model request`;
+      return `step ${event.step}: model request (attempt ${event.attempt}/${event.maxAttempts})`;
     case "model_text_delta":
     case "model_tool_call_delta":
       return undefined;
+    case "provider_retry":
+      return `step ${event.step}: retry provider attempt ${event.nextAttempt}/${event.maxAttempts} after ${event.errorKind} (${event.delayMs}ms)`;
     case "tool_call":
       return `step ${event.step}: tool call ${event.call.name} (${event.call.id})`;
     case "observation":

@@ -76,7 +76,7 @@ Observation
 = Runtime evidence: matching toolCallId + success/output or error/code
 
 RunResult
-= Core terminal result: final_answer, stopped(max_steps), or failed
+= Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
 ```
 
 Expected tool failures such as invalid arguments, missing files, and permission
@@ -96,6 +96,30 @@ The TUI coalesces draft updates every 50 ms and keeps a bounded preview, while
 the Adapter preserves the complete response used by Core. This keeps rendering
 responsive without weakening the execution gate.
 
+## Provider failures and retries
+
+The Adapter converts SDK and protocol failures into provider-neutral error
+kinds. Authentication, permission, quota exhaustion, invalid requests, invalid
+responses, and user cancellation fail fast. Rate limits, connection failures,
+timeouts, interrupted streams, 408/409 responses, and 5xx/529 responses may be
+retried by Core.
+
+Retries repeat only the current model request. They do not restart the Agent or
+repeat an already completed tool call. A Provider attempt therefore does not
+consume another ReAct step:
+
+```text
+step 2, attempt 1 → 429
+step 2, attempt 2 → final answer
+```
+
+Core uses at most 3 attempts per model request, starting with 500 ms exponential
+backoff, up to 25% jitter, a 30-second delay cap, and bounded `Retry-After`
+support. The OpenAI SDK's own retries are disabled so every attempt is visible
+to Core and the TUI. Provider requests have a 60-second timeout. The Core API
+already treats an `AbortSignal` as `stopped: cancelled`; a TUI cancellation key
+is intentionally not part of this milestone yet.
+
 ## Verify
 
 ```bash
@@ -112,6 +136,10 @@ The deterministic suite covers:
 - streamed text and fragmented tool arguments being assembled correctly;
 - interrupted or truncated streams producing a Provider failure with zero tool
   executions;
+- typed 401/429/quota/timeout/5xx/cancellation classification;
+- a real local OpenAI-compatible HTTP 429 followed by a visible Core retry;
+- retrying the second model request without repeating a successful Read;
+- cancellation interrupting retry backoff and preventing tool execution;
 - TUI draft frames for streamed text and tool arguments;
 - a clean TypeScript build and executable CLI entry point.
 
@@ -128,11 +156,17 @@ received, and checks that the final answer contains a marker read from the file.
 
 ## Design reference
 
-The streaming split was checked against Kimi Code at pinned commit
+The Provider work was checked against Kimi Code at pinned commit
 [`56b5480`](https://github.com/MoonshotAI/kimi-code/tree/56b5480ed0da2274f062cd9a38a281187cbe8c36).
 This project adopts provider-neutral deltas, the no-partial-execution gate, and
-50 ms TUI coalescing. It deliberately does not yet persist interrupted turns or
-write a synthetic unexecuted tool result; those belong to the later Session and
+50 ms TUI coalescing. It also adopts typed retryability, per-step retry budgets,
+exponential backoff with jitter, `Retry-After`, and cancellation-aware waiting.
+
+There are deliberate simplifications and deviations. Kimi's Core defaults to
+10 attempts and its OpenAI client retains SDK retries; this milestone uses 3
+Core-visible attempts and disables SDK retries so its attempt count is directly
+explainable and testable. It also does not yet persist interrupted turns or
+write a synthetic unexecuted tool result; those belong to later Session and
 recovery milestones.
 
 ## Current security boundary
@@ -150,13 +184,18 @@ recovery milestones.
 
 ## Status
 
-On 2026-08-30, the deterministic suite passed 20 tests across 6 test files. The
-real-provider smoke passed with DeepSeek in two model rounds: streamed tool-call
+On 2026-08-30, the deterministic suite passed 36 tests across 9 test files. The
+suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
+streams success, proving the retry is owned and surfaced by Core rather than
+hidden inside the SDK. It also proves that retrying the second model request
+preserves the existing Observation and executes Read only once.
+
+The real-provider smoke passed with DeepSeek in two model rounds: streamed tool-call
 arguments were assembled into Read, Runtime returned a successful matching
-Observation, and streamed final text contained the file's private marker. The
-compiled TUI also completed the real README task, displayed bounded streaming
-drafts plus `tool call read → observation success → final answer`, and exited
-normally.
+Observation, and streamed final text contained the file's private marker. It
+used 2 Provider attempts with 0 retries. The compiled TUI also completed the
+real README task, displayed `step + attempt`, bounded streaming drafts, and
+`tool call read → observation success → final answer`, then exited normally.
 
 This proves the current minimum chain runs; it does not yet prove the later
 production-strength Provider, sandbox, Session, or recovery milestones.

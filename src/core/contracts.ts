@@ -82,6 +82,28 @@ export interface ModelCompletionOptions {
   readonly onEvent?: (event: ModelStreamEvent) => void;
 }
 
+export type ProviderErrorKind =
+  | "authentication"
+  | "permission"
+  | "rate_limit"
+  | "quota_exhausted"
+  | "timeout"
+  | "connection"
+  | "interrupted"
+  | "unavailable"
+  | "invalid_request"
+  | "invalid_response"
+  | "cancelled"
+  | "unknown";
+
+export interface ProviderFailure {
+  readonly kind: ProviderErrorKind;
+  readonly retryable: boolean;
+  readonly attempts: number;
+  readonly statusCode?: number;
+  readonly requestId?: string;
+}
+
 export interface ModelProvider {
   complete(
     request: ModelRequest,
@@ -95,19 +117,35 @@ export interface ToolExecutor {
 }
 
 export type RunEvent =
-  | { readonly type: "model_request"; readonly step: number }
+  | {
+      readonly type: "model_request";
+      readonly step: number;
+      readonly attempt: number;
+      readonly maxAttempts: number;
+    }
   | {
       readonly type: "model_text_delta";
       readonly step: number;
+      readonly attempt: number;
       readonly delta: string;
     }
   | {
       readonly type: "model_tool_call_delta";
       readonly step: number;
+      readonly attempt: number;
       readonly index: number;
       readonly id?: string;
       readonly name?: string;
       readonly argumentsDelta?: string;
+    }
+  | {
+      readonly type: "provider_retry";
+      readonly step: number;
+      readonly failedAttempt: number;
+      readonly nextAttempt: number;
+      readonly maxAttempts: number;
+      readonly delayMs: number;
+      readonly errorKind: ProviderErrorKind;
     }
   | { readonly type: "tool_call"; readonly step: number; readonly call: ToolCall }
   | {
@@ -116,13 +154,16 @@ export type RunEvent =
       readonly observation: Observation;
     }
   | { readonly type: "final_answer"; readonly step: number; readonly answer: string }
-  | { readonly type: "stopped"; readonly steps: number; readonly reason: "max_steps" }
+  | { readonly type: "stopped"; readonly steps: number; readonly reason: RunStopReason }
   | {
       readonly type: "failed";
       readonly steps: number;
       readonly reason: RunFailureReason;
       readonly message: string;
+      readonly providerFailure?: ProviderFailure;
     };
+
+export type RunStopReason = "max_steps" | "cancelled";
 
 export type RunFailureReason =
   | "invalid_user_input"
@@ -142,12 +183,13 @@ export type RunResult =
     })
   | (RunEvidence & {
       readonly kind: "stopped";
-      readonly reason: "max_steps";
+      readonly reason: RunStopReason;
     })
   | (RunEvidence & {
       readonly kind: "failed";
       readonly reason: RunFailureReason;
       readonly message: string;
+      readonly providerFailure?: ProviderFailure;
     });
 
 export function observationToModelContent(observation: Observation): string {

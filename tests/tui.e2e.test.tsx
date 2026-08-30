@@ -12,6 +12,7 @@ import type {
   ModelResponse,
   RunResult,
 } from "../src/core/contracts.js";
+import { ProviderError } from "../src/core/provider-error.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import { AgentApp } from "../src/tui/agent-app.js";
 
@@ -42,10 +43,18 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
         },
       ],
     },
+    new ProviderError("rate_limit", "slow down", { retryable: true }),
     { kind: "final", text: "The README contains TUI_E2E_MARKER." },
   ]);
   const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
-  const core = new AgentCore(provider, runtime);
+  const core = new AgentCore(provider, runtime, {
+    providerRetry: {
+      maxAttempts: 3,
+      baseDelayMs: 0,
+      maxDelayMs: 0,
+      jitterRatio: 0,
+    },
+  });
 
   let finish: (result: RunResult) => void = () => undefined;
   const completion = new Promise<RunResult>((resolve) => {
@@ -64,9 +73,12 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   await new Promise<void>((resolve) => setImmediate(resolve));
 
   expect(result.kind).toBe("final_answer");
-  expect(provider.requests).toHaveLength(2);
+  expect(provider.requests).toHaveLength(3);
   expect(view.lastFrame()).toContain("tool call read (call-tui-read)");
   expect(view.lastFrame()).toContain("observation success (call-tui-read)");
+  expect(view.lastFrame()).toContain(
+    "retry provider attempt 2/3 after rate_limit (0ms)",
+  );
   expect(view.lastFrame()).toContain("The README contains TUI_E2E_MARKER.");
   expect(
     view.frames.some((frame) =>
@@ -83,9 +95,9 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
 
 class StreamingScriptedProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
-  readonly #responses: ModelResponse[];
+  readonly #responses: Array<ModelResponse | ProviderError>;
 
-  constructor(responses: readonly ModelResponse[]) {
+  constructor(responses: readonly (ModelResponse | ProviderError)[]) {
     this.#responses = [...responses];
   }
 
@@ -97,6 +109,9 @@ class StreamingScriptedProvider implements ModelProvider {
     const response = this.#responses.shift();
     if (response === undefined) {
       throw new Error("No scripted response remains");
+    }
+    if (response instanceof ProviderError) {
+      throw response;
     }
     if (response.kind === "tool_calls") {
       const call = response.calls[0];

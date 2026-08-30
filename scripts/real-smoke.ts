@@ -22,12 +22,16 @@ try {
   const core = new AgentCore(provider, runtime, { maxSteps: 4 });
   let sawToolCallDelta = false;
   let sawTextDelta = false;
+  let providerAttempts = 0;
+  let providerRetries = 0;
   const result = await core.run(
     "Use the read tool to read README.md, summarize it, and include its exact marker.",
     {
       onEvent: (event) => {
         sawToolCallDelta ||= event.type === "model_tool_call_delta";
         sawTextDelta ||= event.type === "model_text_delta";
+        providerAttempts += event.type === "model_request" ? 1 : 0;
+        providerRetries += event.type === "provider_retry" ? 1 : 0;
       },
     },
   );
@@ -60,6 +64,8 @@ try {
         tool: "read",
         markerVerified: true,
         streamingVerified: true,
+        providerAttempts,
+        providerRetries,
         answer: result.answer,
       },
       null,

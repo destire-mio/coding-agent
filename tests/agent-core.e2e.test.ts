@@ -9,8 +9,10 @@ import type {
   ModelProvider,
   ModelRequest,
   ModelResponse,
+  RunEvent,
   ToolExecutor,
 } from "../src/core/contracts.js";
+import { ProviderError } from "../src/core/provider-error.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
 const temporaryRoots: string[] = [];
@@ -125,7 +127,195 @@ describe("read-only ReAct end-to-end", () => {
 
     const result = await core.run("读取 README.md");
 
-    expect(result).toMatchObject({ kind: "failed", reason: "provider_error", steps: 1 });
+    expect(result).toMatchObject({
+      kind: "failed",
+      reason: "provider_error",
+      steps: 1,
+      providerFailure: {
+        kind: "unknown",
+        retryable: false,
+        attempts: 1,
+      },
+    });
+  });
+
+  it("retries a transient provider failure inside the same ReAct step", async () => {
+    let providerAttempts = 0;
+    const provider: ModelProvider = {
+      complete: async () => {
+        providerAttempts += 1;
+        if (providerAttempts === 1) {
+          throw new ProviderError("rate_limit", "slow down", {
+            retryable: true,
+          });
+        }
+        return { kind: "final", text: "recovered" };
+      },
+    };
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        throw new Error("must not execute");
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      providerRetry: zeroDelayRetryPolicy(),
+    });
+    const events: RunEvent[] = [];
+
+    const result = await core.run("answer", {
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({ kind: "final_answer", steps: 1 });
+    expect(providerAttempts).toBe(2);
+    expect(
+      events.filter((event) => event.type === "model_request"),
+    ).toMatchObject([
+      { step: 1, attempt: 1, maxAttempts: 3 },
+      { step: 1, attempt: 2, maxAttempts: 3 },
+    ]);
+    expect(events).toContainEqual({
+      type: "provider_retry",
+      step: 1,
+      failedAttempt: 1,
+      nextAttempt: 2,
+      maxAttempts: 3,
+      delayMs: 0,
+      errorKind: "rate_limit",
+    });
+  });
+
+  it("does not retry authentication or user cancellation", async () => {
+    for (const scenario of [
+      {
+        error: new ProviderError("authentication", "bad key", {
+          retryable: false,
+        }),
+        expected: { kind: "failed", reason: "provider_error" },
+      },
+      {
+        error: new ProviderError("cancelled", "user cancelled", {
+          retryable: false,
+        }),
+        expected: { kind: "stopped", reason: "cancelled" },
+      },
+    ] as const) {
+      let providerAttempts = 0;
+      const provider: ModelProvider = {
+        complete: async () => {
+          providerAttempts += 1;
+          throw scenario.error;
+        },
+      };
+      const runtime: ToolExecutor = {
+        definitions: () => [],
+        execute: async () => {
+          throw new Error("must not execute");
+        },
+      };
+      const core = new AgentCore(provider, runtime, {
+        providerRetry: zeroDelayRetryPolicy(),
+      });
+
+      const result = await core.run("answer");
+
+      expect(result).toMatchObject(scenario.expected);
+      expect(providerAttempts).toBe(1);
+    }
+  });
+
+  it("does not execute a completed ToolCall when cancellation wins the boundary", async () => {
+    const controller = new AbortController();
+    let executions = 0;
+    const provider: ModelProvider = {
+      complete: async () => {
+        controller.abort();
+        return {
+          kind: "tool_calls",
+          content: "",
+          calls: [
+            {
+              id: "call-after-cancel",
+              name: "read",
+              rawArguments: JSON.stringify({ path: "README.md" }),
+            },
+          ],
+        };
+      },
+    };
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async (call) => {
+        executions += 1;
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "success",
+          output: "must not run",
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime);
+
+    const result = await core.run("读取 README.md", {
+      signal: controller.signal,
+    });
+
+    expect(result).toMatchObject({ kind: "stopped", reason: "cancelled" });
+    expect(executions).toBe(0);
+  });
+
+  it("retries only the second model request and preserves the Read Observation", async () => {
+    const { workspace } = await createWorkspace();
+    await writeFile(join(workspace, "README.md"), "PRESERVED_OBSERVATION\n", "utf8");
+    const delegate = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+    let executions = 0;
+    const runtime: ToolExecutor = {
+      definitions: () => delegate.definitions(),
+      execute: async (call) => {
+        executions += 1;
+        return delegate.execute(call);
+      },
+    };
+    const requests: ModelRequest[] = [];
+    const provider: ModelProvider = {
+      complete: async (request) => {
+        requests.push(request);
+        if (requests.length === 1) {
+          return {
+            kind: "tool_calls",
+            content: "",
+            calls: [
+              {
+                id: "call-preserved-read",
+                name: "read",
+                rawArguments: JSON.stringify({ path: "README.md" }),
+              },
+            ],
+          };
+        }
+        if (requests.length === 2) {
+          throw new ProviderError("rate_limit", "slow down", {
+            retryable: true,
+          });
+        }
+        return { kind: "final", text: "PRESERVED_OBSERVATION" };
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      providerRetry: zeroDelayRetryPolicy(),
+    });
+
+    const result = await core.run("读取 README.md");
+
+    expect(result).toMatchObject({ kind: "final_answer", steps: 2 });
+    expect(requests).toHaveLength(3);
+    expect(executions).toBe(1);
+    expect(requests[1]?.messages.at(-1)).toEqual(
+      requests[2]?.messages.at(-1),
+    );
+    expect(JSON.stringify(requests[2])).toContain("PRESERVED_OBSERVATION");
   });
 
   it("never executes a partial streamed ToolCall after provider failure", async () => {
@@ -154,10 +344,14 @@ describe("read-only ReAct end-to-end", () => {
           name: "read",
           argumentsDelta: '{"path":"READ',
         });
-        throw new Error("provider stream disconnected");
+        throw new ProviderError("interrupted", "provider stream disconnected", {
+          retryable: true,
+        });
       },
     };
-    const core = new AgentCore(provider, runtime);
+    const core = new AgentCore(provider, runtime, {
+      providerRetry: { maxAttempts: 1 },
+    });
     const eventTypes: string[] = [];
 
     const result = await core.run("读取 README.md", {
@@ -171,6 +365,15 @@ describe("read-only ReAct end-to-end", () => {
     expect(eventTypes).not.toContain("observation");
   });
 });
+
+function zeroDelayRetryPolicy() {
+  return {
+    maxAttempts: 3,
+    baseDelayMs: 0,
+    maxDelayMs: 0,
+    jitterRatio: 0,
+  } as const;
+}
 
 class ScriptedProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];

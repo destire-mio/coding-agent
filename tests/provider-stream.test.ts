@@ -94,7 +94,11 @@ describe("OpenAI-compatible provider streaming", () => {
           }),
         ),
       ),
-    ).rejects.toThrow("without a finish reason");
+    ).rejects.toMatchObject({
+      kind: "interrupted",
+      retryable: true,
+      message: "The provider stream ended without a finish reason.",
+    });
   });
 
   it("rejects a truncated finish instead of returning partial tool calls", async () => {
@@ -114,7 +118,11 @@ describe("OpenAI-compatible provider streaming", () => {
           chunk({}, "length"),
         ),
       ),
-    ).rejects.toThrow("did not complete safely: length");
+    ).rejects.toMatchObject({
+      kind: "invalid_response",
+      retryable: false,
+      message: "The provider stream did not complete safely: length.",
+    });
   });
 });
 

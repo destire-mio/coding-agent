@@ -1,14 +1,28 @@
 import type {
   AgentMessage,
-  ModelStreamEvent,
   ModelProvider,
+  ModelRequest,
+  ModelResponse,
+  ModelStreamEvent,
   Observation,
+  ProviderFailure,
   RunEvent,
   RunFailureReason,
   RunResult,
   ToolCall,
   ToolExecutor,
 } from "./contracts.js";
+import {
+  asProviderError,
+  toProviderFailure,
+} from "./provider-error.js";
+import {
+  providerRetryDelayMs,
+  resolveProviderRetryPolicy,
+  waitForProviderRetry,
+  type ProviderRetryOptions,
+  type ProviderRetryPolicy,
+} from "./provider-retry.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a read-only coding agent operating inside one workspace.
 Use the read tool whenever the user asks about file contents. Never invent file contents.
@@ -19,6 +33,7 @@ When you have enough evidence, return a concise final answer without a tool call
 export interface AgentCoreOptions {
   readonly maxSteps?: number;
   readonly systemPrompt?: string;
+  readonly providerRetry?: ProviderRetryOptions;
 }
 
 export interface RunOptions {
@@ -31,6 +46,7 @@ export class AgentCore {
   readonly #runtime: ToolExecutor;
   readonly #maxSteps: number;
   readonly #systemPrompt: string;
+  readonly #providerRetry: ProviderRetryPolicy;
 
   constructor(
     provider: ModelProvider,
@@ -46,6 +62,7 @@ export class AgentCore {
     this.#runtime = runtime;
     this.#maxSteps = maxSteps;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
+    this.#providerRetry = resolveProviderRetryPolicy(options.providerRetry);
   }
 
   async run(userInput: string, options: RunOptions = {}): Promise<RunResult> {
@@ -66,52 +83,22 @@ export class AgentCore {
     const seenToolCallIds = new Set<string>();
 
     for (let step = 1; step <= this.#maxSteps; step += 1) {
-      this.#emit(options.onEvent, { type: "model_request", step });
-
-      let response;
-      try {
-        const onModelEvent =
-          options.onEvent === undefined
-            ? undefined
-            : (event: ModelStreamEvent) => {
-                if (event.type === "text_delta") {
-                  this.#emit(options.onEvent, {
-                    type: "model_text_delta",
-                    step,
-                    delta: event.delta,
-                  });
-                  return;
-                }
-                this.#emit(options.onEvent, {
-                  type: "model_tool_call_delta",
-                  step,
-                  index: event.index,
-                  ...(event.id === undefined ? {} : { id: event.id }),
-                  ...(event.name === undefined ? {} : { name: event.name }),
-                  ...(event.argumentsDelta === undefined
-                    ? {}
-                    : { argumentsDelta: event.argumentsDelta }),
-                });
-              };
-        response = await this.#provider.complete(
-          {
-            systemPrompt: this.#systemPrompt,
-            messages: [...messages],
-            tools: this.#runtime.definitions(),
-          },
-          {
-            ...(options.signal === undefined ? {} : { signal: options.signal }),
-            ...(onModelEvent === undefined ? {} : { onEvent: onModelEvent }),
-          },
-        );
-      } catch {
-        return this.#failed(
-          step,
-          messages,
-          "provider_error",
-          "The model provider request failed.",
-          options.onEvent,
-        );
+      const completion = await this.#completeModel(
+        {
+          systemPrompt: this.#systemPrompt,
+          messages: [...messages],
+          tools: this.#runtime.definitions(),
+        },
+        step,
+        messages,
+        options,
+      );
+      if (completion.kind === "terminal") {
+        return completion.result;
+      }
+      const response = completion.response;
+      if (isSignalAborted(options.signal)) {
+        return this.#stopped(step, messages, "cancelled", options.onEvent);
       }
 
       if (response.kind === "final") {
@@ -164,6 +151,9 @@ export class AgentCore {
       });
 
       for (const call of response.calls) {
+        if (isSignalAborted(options.signal)) {
+          return this.#stopped(step, messages, "cancelled", options.onEvent);
+        }
         seenToolCallIds.add(call.id);
         this.#emit(options.onEvent, { type: "tool_call", step, call });
 
@@ -200,17 +190,160 @@ export class AgentCore {
       }
     }
 
-    this.#emit(options.onEvent, {
-      type: "stopped",
-      steps: this.#maxSteps,
-      reason: "max_steps",
-    });
-    return {
-      kind: "stopped",
-      reason: "max_steps",
-      steps: this.#maxSteps,
-      messages: [...messages],
+    return this.#stopped(
+      this.#maxSteps,
+      messages,
+      "max_steps",
+      options.onEvent,
+    );
+  }
+
+  async #completeModel(
+    request: ModelRequest,
+    step: number,
+    messages: readonly AgentMessage[],
+    options: RunOptions,
+  ): Promise<ModelCompletionOutcome> {
+    if (options.signal?.aborted === true) {
+      return {
+        kind: "terminal",
+        result: this.#stopped(step - 1, messages, "cancelled", options.onEvent),
+      };
+    }
+
+    for (
+      let attempt = 1;
+      attempt <= this.#providerRetry.maxAttempts;
+      attempt += 1
+    ) {
+      this.#emit(options.onEvent, {
+        type: "model_request",
+        step,
+        attempt,
+        maxAttempts: this.#providerRetry.maxAttempts,
+      });
+
+      const onModelEvent = this.#modelEventForwarder(
+        step,
+        attempt,
+        options.onEvent,
+      );
+
+      try {
+        const response = await this.#provider.complete(request, {
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          ...(onModelEvent === undefined ? {} : { onEvent: onModelEvent }),
+        });
+        return { kind: "response", response };
+      } catch (error) {
+        const providerError = asProviderError(error, options.signal);
+        if (providerError.kind === "cancelled") {
+          return {
+            kind: "terminal",
+            result: this.#stopped(step, messages, "cancelled", options.onEvent),
+          };
+        }
+
+        if (
+          !providerError.retryable ||
+          attempt >= this.#providerRetry.maxAttempts
+        ) {
+          return {
+            kind: "terminal",
+            result: this.#failed(
+              step,
+              messages,
+              "provider_error",
+              `The model provider request failed (${providerError.kind}).`,
+              options.onEvent,
+              toProviderFailure(providerError, attempt),
+            ),
+          };
+        }
+
+        const delayMs = providerRetryDelayMs(
+          providerError,
+          attempt,
+          this.#providerRetry,
+        );
+        this.#emit(options.onEvent, {
+          type: "provider_retry",
+          step,
+          failedAttempt: attempt,
+          nextAttempt: attempt + 1,
+          maxAttempts: this.#providerRetry.maxAttempts,
+          delayMs,
+          errorKind: providerError.kind,
+        });
+
+        try {
+          await waitForProviderRetry(delayMs, options.signal);
+        } catch (error) {
+          const waitError = asProviderError(error, options.signal);
+          if (waitError.kind === "cancelled") {
+            return {
+              kind: "terminal",
+              result: this.#stopped(step, messages, "cancelled", options.onEvent),
+            };
+          }
+          return {
+            kind: "terminal",
+            result: this.#failed(
+              step,
+              messages,
+              "provider_error",
+              `The provider retry wait failed (${waitError.kind}).`,
+              options.onEvent,
+              toProviderFailure(waitError, attempt),
+            ),
+          };
+        }
+      }
+    }
+
+    throw new Error("Provider retry loop ended without an outcome.");
+  }
+
+  #modelEventForwarder(
+    step: number,
+    attempt: number,
+    onEvent: RunOptions["onEvent"],
+  ): ((event: ModelStreamEvent) => void) | undefined {
+    if (onEvent === undefined) {
+      return undefined;
+    }
+    return (event) => {
+      if (event.type === "text_delta") {
+        this.#emit(onEvent, {
+          type: "model_text_delta",
+          step,
+          attempt,
+          delta: event.delta,
+        });
+        return;
+      }
+      this.#emit(onEvent, {
+        type: "model_tool_call_delta",
+        step,
+        attempt,
+        index: event.index,
+        ...(event.id === undefined ? {} : { id: event.id }),
+        ...(event.name === undefined ? {} : { name: event.name }),
+        ...(event.argumentsDelta === undefined
+          ? {}
+          : { argumentsDelta: event.argumentsDelta }),
+      });
     };
+  }
+
+  #stopped(
+    steps: number,
+    messages: readonly AgentMessage[],
+    reason: "max_steps" | "cancelled",
+    onEvent: RunOptions["onEvent"],
+  ): RunResult {
+    this.#emit(onEvent, { type: "stopped", steps, reason });
+    return { kind: "stopped", reason, steps, messages: [...messages] };
   }
 
   #failed(
@@ -219,9 +352,23 @@ export class AgentCore {
     reason: RunFailureReason,
     message: string,
     onEvent: RunOptions["onEvent"],
+    providerFailure?: ProviderFailure,
   ): RunResult {
-    this.#emit(onEvent, { type: "failed", steps, reason, message });
-    return { kind: "failed", reason, message, steps, messages: [...messages] };
+    this.#emit(onEvent, {
+      type: "failed",
+      steps,
+      reason,
+      message,
+      ...(providerFailure === undefined ? {} : { providerFailure }),
+    });
+    return {
+      kind: "failed",
+      reason,
+      message,
+      steps,
+      messages: [...messages],
+      ...(providerFailure === undefined ? {} : { providerFailure }),
+    };
   }
 
   #emit(onEvent: RunOptions["onEvent"], event: RunEvent): void {
@@ -235,4 +382,12 @@ export class AgentCore {
       // An observer such as the TUI must never be able to break the Core loop.
     }
   }
+}
+
+type ModelCompletionOutcome =
+  | { readonly kind: "response"; readonly response: ModelResponse }
+  | { readonly kind: "terminal"; readonly result: RunResult };
+
+function isSignalAborted(signal?: AbortSignal): boolean {
+  return signal?.aborted === true;
 }
