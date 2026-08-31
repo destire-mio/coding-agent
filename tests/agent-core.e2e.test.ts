@@ -88,6 +88,62 @@ describe("read-only ReAct end-to-end", () => {
     }
   });
 
+  it("executes multiple tool calls sequentially in model order", async () => {
+    const executionOrder: string[] = [];
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async (call) => {
+        executionOrder.push(`start:${call.id}`);
+        await Promise.resolve();
+        executionOrder.push(`finish:${call.id}`);
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "success",
+          output: call.id,
+        };
+      },
+    };
+    const provider = new ScriptedProvider([
+      {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-first",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "README.md" }),
+          },
+          {
+            id: "call-second",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "package.json" }),
+          },
+        ],
+      },
+      {
+        kind: "final",
+        content: [{ type: "text", text: "Both reads completed." }],
+      },
+    ]);
+    const core = new AgentCore(provider, runtime);
+
+    const result = await core.run("Read README.md and package.json");
+
+    expect(result.kind).toBe("final_answer");
+    expect(executionOrder).toEqual([
+      "start:call-first",
+      "finish:call-first",
+      "start:call-second",
+      "finish:call-second",
+    ]);
+    expect(
+      provider.requests[1]?.messages
+        .filter((message) => message.role === "tool")
+        .map((message) => message.toolCallId),
+    ).toEqual(["call-first", "call-second"]);
+  });
+
   it("feeds a denied Read back to the model as an error Observation", async () => {
     const { root, workspace } = await createWorkspace();
     await writeFile(join(root, "secret.txt"), "DO_NOT_LEAK", "utf8");
