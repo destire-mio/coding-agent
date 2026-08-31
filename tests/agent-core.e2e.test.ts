@@ -88,6 +88,40 @@ describe("read-only ReAct end-to-end", () => {
     }
   });
 
+  it("continues a bounded Read with nextCursor before answering", async () => {
+    const { workspace } = await createWorkspace();
+    const content = "alpha\nbeta\nPAGED_MARKER\n";
+    await writeFile(join(workspace, "large.log"), content, "utf8");
+    const runtime = await ToolRuntime.readOnly({
+      workspaceRoot: workspace,
+      maxReadBytes: 13,
+    });
+    const provider = new PagingReadProvider("large.log");
+    const core = new AgentCore(provider, runtime, { maxSteps: 6 });
+
+    const result = await core.run("Read all of large.log and report its marker");
+
+    expect(result).toMatchObject({
+      kind: "final_answer",
+      answer: "The complete file contains PAGED_MARKER.",
+      steps: 3,
+    });
+    expect(provider.requests).toHaveLength(3);
+    const observations = result.messages.filter(
+      (message) => message.role === "tool",
+    );
+    expect(observations).toHaveLength(2);
+    expect(
+      observations
+        .map((message) =>
+          message.observation.status === "success"
+            ? readPageContent(message.observation.output)
+            : "",
+        )
+        .join(""),
+    ).toBe(content);
+  });
+
   it("executes multiple tool calls sequentially in model order", async () => {
     const executionOrder: string[] = [];
     const runtime: ToolExecutor = {
@@ -694,6 +728,78 @@ class ScriptedProvider implements ModelProvider {
   }
 }
 
+class PagingReadProvider implements ModelProvider {
+  readonly requests: ModelRequest[] = [];
+
+  constructor(private readonly path: string) {}
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    const observations = request.messages.filter(
+      (message) => message.role === "tool",
+    );
+    const lastObservation = observations.at(-1)?.observation;
+
+    if (lastObservation === undefined) {
+      return {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-page-1",
+            name: "read",
+            rawArguments: JSON.stringify({ path: this.path }),
+          },
+        ],
+      };
+    }
+    if (lastObservation.status !== "success") {
+      throw new Error("Expected a successful paged Read Observation.");
+    }
+
+    const page = readPageOutput(lastObservation.output);
+    if (!page.complete) {
+      if (page.nextCursor === undefined) {
+        throw new Error("An incomplete Read page must include nextCursor.");
+      }
+      return {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: `call-page-${observations.length + 1}`,
+            name: "read",
+            rawArguments: JSON.stringify({
+              path: this.path,
+              cursor: page.nextCursor,
+            }),
+          },
+        ],
+      };
+    }
+
+    const allContent = observations
+      .map((message) =>
+        message.observation.status === "success"
+          ? readPageContent(message.observation.output)
+          : "",
+      )
+      .join("");
+    if (!allContent.includes("PAGED_MARKER")) {
+      throw new Error("The completed pages did not contain the expected marker.");
+    }
+    return {
+      kind: "final",
+      content: [
+        {
+          type: "text",
+          text: "The complete file contains PAGED_MARKER.",
+        },
+      ],
+    };
+  }
+}
+
 class RepeatingReadProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
 
@@ -711,6 +817,31 @@ class RepeatingReadProvider implements ModelProvider {
       ],
     };
   }
+}
+
+function readPageOutput(output: unknown): {
+  readonly content: string;
+  readonly complete: boolean;
+  readonly nextCursor?: string;
+} {
+  if (typeof output !== "object" || output === null) {
+    throw new Error("Expected structured Read page output.");
+  }
+  const page = output as Record<string, unknown>;
+  if (typeof page["content"] !== "string" || typeof page["complete"] !== "boolean") {
+    throw new Error("Expected content and complete in Read page output.");
+  }
+  return {
+    content: page["content"],
+    complete: page["complete"],
+    ...(typeof page["nextCursor"] === "string"
+      ? { nextCursor: page["nextCursor"] }
+      : {}),
+  };
+}
+
+function readPageContent(output: unknown): string {
+  return readPageOutput(output).content;
 }
 
 async function createWorkspace(): Promise<{ root: string; workspace: string }> {

@@ -22,6 +22,15 @@ The model proposes actions; it never reads files directly. Core owns the loop an
 termination. Tool Runtime owns argument validation, permission checks, and tool
 execution.
 
+Read returns at most one bounded page per tool call. If `complete` is `false`,
+the Observation includes `nextCursor`; the model must call Read again with the
+same path and pass that value as `cursor`. Core schedules the next proposal but
+does not secretly read ahead. Runtime validates the cursor, rejects a changed
+file, and returns the next structured page. The cursor is integrity-protected
+and bound to that path, so model-edited or cross-file cursors fail instead of
+silently skipping content. A single line longer than the page limit is continued
+on a UTF-8 character boundary instead of being silently discarded.
+
 Core also owns the lifecycle of one active run:
 
 ```text
@@ -99,6 +108,9 @@ AssistantContentPart
 Observation
 = Runtime evidence: matching toolCallId + success/output or error/code
 
+Read page output
+= content + page byte count/line metadata + complete + optional nextCursor
+
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
 
@@ -172,6 +184,9 @@ The deterministic suite covers:
 - workspace path traversal, outside absolute paths, and symlink escapes;
 - duplicate registrations, unknown tools, malformed JSON, invalid schemas, and
   missing files;
+- bounded Read continuation across multiple pages, exact reconstruction of one
+  oversized UTF-8 line, malformed/tampered/cross-file cursors, and file-change
+  rejection;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
@@ -201,10 +216,11 @@ credentials:
 node --env-file=.env --import tsx scripts/real-smoke.ts
 ```
 
-It creates a temporary workspace, requires the real model to call Read, verifies
-the matching Observation, checks that thinking, tool-call, and text stream
-deltas were received, verifies that tool-call reasoning was retained by Core,
-and checks that the final answer contains a marker read from the file.
+It creates a temporary workspace whose marker exists only on the second Read
+page. The smoke requires the real model to follow `nextCursor`, verifies that
+all successful Observations reconstruct the file exactly, checks thinking,
+tool-call, and text stream deltas, verifies tool-call reasoning retention, and
+requires the final answer to contain the second-page marker.
 
 ## Design reference
 
@@ -236,12 +252,20 @@ propagation, but deliberately omits Kimi's Session, dialog, compaction,
 double-Esc exit, and subagent states. Its current Read boundary is cooperative:
 an already-started read completes and records reality, then the Core stops.
 
+Read paging was also compared at pinned commit `619564d`, specifically
+`packages/agent-core-v2/src/agent/tools/os/read/`. Kimi bounds each call by lines
+and bytes and continues with `line_offset`, but truncates an oversized single
+line for model display. This project keeps the bounded-call principle and uses a
+Runtime-issued byte cursor so even one oversized UTF-8 line can be continued
+without silent content loss. Grep remains a separate later tool.
+
 ## Current security boundary
 
 - Only the `read` tool is registered.
 - Read accepts a relative path, canonicalizes it, and rejects paths or symlinks
   resolving outside the workspace.
-- Read accepts regular UTF-8 files up to 128 KiB for this milestone.
+- Read accepts regular UTF-8 files and returns at most 128 KiB per call. Larger
+  files continue through `nextCursor`; stale cursors fail with `file_changed`.
 - File contents returned by Read are sent to the configured model provider as an
   Observation. The provider is therefore part of the data trust boundary.
 - Model reasoning may repeat sensitive material from the prompt or Observation.
