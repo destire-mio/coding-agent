@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 
 import type { ModelRequest } from "../src/core/contracts.js";
+import { ProviderError } from "../src/core/provider-error.js";
 import type { ProviderConfig } from "../src/provider/config.js";
 import { buildChatCompletionRequest } from "../src/provider/openai-compatible-provider.js";
 
@@ -99,5 +100,45 @@ describe("DeepSeek Chat Completions request", () => {
         },
       ],
     });
+  });
+
+  it("rejects opaque reasoning state instead of silently dropping it", () => {
+    const config: ProviderConfig = {
+      apiKey: "not-sent-by-this-test",
+      model: "deepseek-v4-flash",
+      baseURL: "https://api.deepseek.com",
+      thinking: "enabled",
+    };
+    const request: ModelRequest = {
+      systemPrompt: "Use Read.",
+      messages: [
+        { role: "user", content: "Read README.md" },
+        {
+          role: "assistant",
+          content: [
+            {
+              type: "think",
+              think: "I should read the file.",
+              opaque: "provider-private-state",
+            },
+          ],
+          toolCalls: [
+            {
+              id: "call-readme",
+              name: "read",
+              rawArguments: '{"path":"README.md"}',
+            },
+          ],
+        },
+      ],
+      tools: [],
+    };
+
+    expect(() => buildChatCompletionRequest(config, request)).toThrowError(
+      expect.objectContaining<Partial<ProviderError>>({
+        kind: "invalid_request",
+        retryable: false,
+      }),
+    );
   });
 });
