@@ -39,6 +39,19 @@ and result offset, but files changing between calls may still cause repeated or
 missed matches. Grep always filters sensitive files and VCS metadata. A timeout
 discards partial matches and returns `search_timeout`.
 
+Large Read and Grep results stay inside this bounded paging contract. The
+current v1 does not write complete results to an Artifact or return an external
+result reference; that extra storage lifecycle is deferred until a real use case
+requires a stable snapshot or later reuse of the complete result.
+
+This milestone trusts the workspace to be controlled by the current user. The
+Runtime rejects lexical and resolved path escapes, and Read refuses to follow a
+symlink in the final path component, but this is not an OS sandbox. It does not
+claim to defend against another malicious process replacing parent directories
+between the path check and the later Read or ripgrep open. Supporting hostile,
+concurrently mutated workspaces requires descriptor-based path traversal and a
+process sandbox in a later security milestone.
+
 Core also owns the lifecycle of one active run:
 
 ```text
