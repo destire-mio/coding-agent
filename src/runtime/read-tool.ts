@@ -7,7 +7,18 @@ import type { RuntimeTool, ToolOutcome } from "./tool.js";
 import { toolError } from "./tool.js";
 
 const DEFAULT_MAX_READ_BYTES = 128 * 1024;
-const readArgumentsSchema = z.object({ path: z.string().trim().min(1) }).strict();
+const readArgumentsSchema = z
+  .object({
+    path: z
+      .string()
+      .trim()
+      .min(1)
+      .describe("A path relative to the workspace root, for example README.md."),
+  })
+  .strict();
+const readInputSchema = z.toJSONSchema(readArgumentsSchema, {
+  target: "openapi-3.0",
+});
 
 export interface ReadToolOptions {
   readonly workspaceRoot: string;
@@ -21,18 +32,7 @@ export class ReadTool implements RuntimeTool {
     name: "read",
     description:
       "Read one UTF-8 text file inside the workspace. The path must be relative to the workspace root.",
-    inputSchema: {
-      type: "object",
-      additionalProperties: false,
-      properties: {
-        path: {
-          type: "string",
-          minLength: 1,
-          description: "A path relative to the workspace root, for example README.md.",
-        },
-      },
-      required: ["path"],
-    },
+    inputSchema: readInputSchema,
   } as const;
 
   readonly #workspaceRoot: string;

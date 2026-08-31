@@ -16,6 +16,32 @@ afterEach(async () => {
 });
 
 describe("ToolRuntime Read", () => {
+  it("discloses the same strict Read argument contract to the model", async () => {
+    const { workspace } = await createWorkspace();
+    const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+
+    expect(runtime.definitions()).toEqual([
+      {
+        name: "read",
+        description:
+          "Read one UTF-8 text file inside the workspace. The path must be relative to the workspace root.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            path: {
+              type: "string",
+              minLength: 1,
+              description:
+                "A path relative to the workspace root, for example README.md.",
+            },
+          },
+          required: ["path"],
+          additionalProperties: false,
+        },
+      },
+    ]);
+  });
+
   it("reads a UTF-8 file inside the workspace", async () => {
     const { workspace } = await createWorkspace();
     await writeFile(join(workspace, "README.md"), "hello from workspace\n", "utf8");
