@@ -15,7 +15,7 @@ afterEach(async () => {
   );
 });
 
-describe("ToolRuntime Read", () => {
+describe("ToolRuntime", () => {
   it("discloses the same strict Read argument contract to the model", async () => {
     const { workspace } = await createWorkspace();
     const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
@@ -57,6 +57,34 @@ describe("ToolRuntime Read", () => {
         content: "hello from workspace\n",
       });
     }
+  });
+
+  it("rejects duplicate tool registrations", () => {
+    const duplicateTool: RuntimeTool = {
+      definition: {
+        name: "duplicate",
+        description: "A duplicate registration test double.",
+        inputSchema: { type: "object", additionalProperties: false },
+      },
+      execute: async () => ({ status: "success", output: null }),
+    };
+
+    expect(() => new ToolRuntime([duplicateTool, duplicateTool])).toThrow(
+      "Duplicate tool registration: duplicate",
+    );
+  });
+
+  it("returns a paired unknown_tool Observation before parsing arguments", async () => {
+    const runtime = new ToolRuntime([]);
+
+    const observation = await runtime.execute({
+      id: "call-unknown",
+      name: "edit",
+      rawArguments: "not-json",
+    });
+
+    expectError(observation, "call-unknown", "unknown_tool");
+    expect(observation.toolName).toBe("edit");
   });
 
   it("returns a corresponding error Observation for path traversal", async () => {
@@ -105,6 +133,19 @@ describe("ToolRuntime Read", () => {
     });
 
     expectError(observation, "call-invalid", "invalid_arguments");
+  });
+
+  it("returns invalid_arguments for malformed JSON", async () => {
+    const { workspace } = await createWorkspace();
+    const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+
+    const observation = await runtime.execute({
+      id: "call-malformed",
+      name: "read",
+      rawArguments: '{"path":',
+    });
+
+    expectError(observation, "call-malformed", "invalid_arguments");
   });
 
   it("returns a not_found Observation", async () => {
