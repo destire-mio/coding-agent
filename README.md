@@ -111,6 +111,14 @@ Expected tool failures such as invalid arguments, missing files, and permission
 denials are returned to the model as error Observations. Provider or Core failures
 terminate the run instead.
 
+Model-visible tool definitions come from the same Runtime registry used for
+execution. Duplicate names fail during Runtime construction, while an
+unregistered name returns a paired `unknown_tool` Observation. If one model
+response contains multiple tool calls, Core executes them sequentially in model
+order and records their Observations in the same order. The current run's
+messages form an in-memory trajectory returned in `RunResult`; persistent audit
+storage belongs to the later Session milestone.
+
 ## Streaming boundary
 
 Provider stream fragments are drafts, not executable tool calls. The Adapter
@@ -162,7 +170,9 @@ The deterministic suite covers:
 
 - TUI → Core → model double → Read → Observation → model double → final answer;
 - workspace path traversal, outside absolute paths, and symlink escapes;
-- malformed arguments and missing files;
+- duplicate registrations, unknown tools, malformed JSON, invalid schemas, and
+  missing files;
+- multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
 - streamed thinking, text, and fragmented tool arguments being assembled
@@ -244,17 +254,19 @@ an already-started read completes and records reality, then the Core stops.
 
 ## Status
 
-On 2026-08-31, the deterministic suite passed 44 tests across 11 test files. The
+On 2026-08-31, the deterministic suite passed 52 tests across 11 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
 `reasoning_content` is streamed into a generic `think` part and serialized back
 beside the original ToolCall and Read Observation on the next request. Retrying
 the second model request preserves the existing Observation and executes Read
-only once. A deterministic Ink TUI trajectory also proves that Esc reaches the
-Core state machine, aborts the Provider signal, and ends as
-`stopped: cancelled`. A separate in-flight Read test proves that its completed
-Observation is retained while the next model request is suppressed.
+only once. Tool Runtime contract tests lock same-registry disclosure, duplicate
+registration rejection, paired unknown-tool and malformed-argument failures,
+and sequential multi-call scheduling. A deterministic Ink TUI trajectory also
+proves that Esc reaches the Core state machine, aborts the Provider signal, and
+ends as `stopped: cancelled`. A separate in-flight Read test proves that its
+completed Observation is retained while the next model request is suppressed.
 
 The real-provider smoke passed with DeepSeek Thinking in two model rounds:
 reasoning and tool-call arguments were streamed, Core retained the tool-call
