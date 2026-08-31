@@ -5,6 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 
 import type { Observation, ToolCall } from "../src/core/contracts.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
+import type { RuntimeTool } from "../src/runtime/tool.js";
 
 const temporaryRoots: string[] = [];
 
@@ -87,6 +88,31 @@ describe("ToolRuntime Read", () => {
     const observation = await runtime.execute(readCall("missing.md"));
 
     expectError(observation, "call-read", "not_found");
+  });
+
+  it("returns a paired, sanitized Observation when a tool throws", async () => {
+    const throwingTool: RuntimeTool = {
+      definition: {
+        name: "throwing_tool",
+        description: "A deterministic failing tool double.",
+        inputSchema: { type: "object", additionalProperties: false },
+      },
+      execute: async () => {
+        throw new Error("private implementation detail");
+      },
+    };
+    const runtime = new ToolRuntime([throwingTool]);
+
+    const observation = await runtime.execute({
+      id: "call-throwing",
+      name: "throwing_tool",
+      rawArguments: "{}",
+    });
+
+    expectError(observation, "call-throwing", "tool_internal_error");
+    expect(JSON.stringify(observation)).not.toContain(
+      "private implementation detail",
+    );
   });
 });
 

@@ -131,6 +131,83 @@ describe("read-only ReAct end-to-end", () => {
     expect(JSON.stringify(secondRequest)).not.toContain("DO_NOT_LEAK");
   });
 
+  it("fails the run when Runtime throws before returning an Observation", async () => {
+    const provider = new ScriptedProvider([
+      {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-runtime-crash",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "README.md" }),
+          },
+        ],
+      },
+    ]);
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        throw new Error("runtime crashed");
+      },
+    };
+    const events: RunEvent[] = [];
+    const core = new AgentCore(provider, runtime);
+
+    const result = await core.run("读取 README.md", {
+      onEvent: (event) => events.push(event),
+    });
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      reason: "runtime_error",
+      steps: 1,
+    });
+    expect(provider.requests).toHaveLength(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "tool_call", step: 1 }),
+    );
+    expect(events.some((event) => event.type === "observation")).toBe(false);
+  });
+
+  it("fails the run when Runtime returns an Observation for another call", async () => {
+    const provider = new ScriptedProvider([
+      {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-expected",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "README.md" }),
+          },
+        ],
+      },
+    ]);
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => ({
+        toolCallId: "call-wrong",
+        toolName: "read",
+        status: "success",
+        output: "untrusted result",
+      }),
+    };
+    const core = new AgentCore(provider, runtime);
+
+    const result = await core.run("读取 README.md");
+
+    expect(result).toMatchObject({
+      kind: "failed",
+      reason: "runtime_error",
+      steps: 1,
+    });
+    expect(provider.requests).toHaveLength(1);
+    expect(result.messages.some((message) => message.role === "tool")).toBe(
+      false,
+    );
+  });
+
   it("stops at maxSteps without claiming success", async () => {
     const { workspace } = await createWorkspace();
     await writeFile(join(workspace, "README.md"), "loop\n", "utf8");
