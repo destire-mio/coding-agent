@@ -12,8 +12,6 @@ export type AssistantContentPart =
   | {
       readonly type: "think";
       readonly think: string;
-      /** Provider-owned continuation state. Core preserves it; TUI never renders it. */
-      readonly opaque?: string;
     };
 
 export interface ToolDefinition {

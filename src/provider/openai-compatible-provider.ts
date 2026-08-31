@@ -444,18 +444,7 @@ function toOpenAIMessage(
   switch (message.role) {
     case "user":
       return { role: "user", content: message.content };
-    case "assistant": {
-      if (
-        message.content.some(
-          (part) => part.type === "think" && part.opaque !== undefined,
-        )
-      ) {
-        throw new ProviderError(
-          "invalid_request",
-          "The configured OpenAI-compatible provider cannot replay opaque reasoning state.",
-          { retryable: false },
-        );
-      }
+    case "assistant":
       return {
         role: "assistant",
         content: assistantText(message.content) || null,
@@ -472,7 +461,6 @@ function toOpenAIMessage(
               })),
             }),
       };
-    }
     case "tool":
       return {
         role: "tool",

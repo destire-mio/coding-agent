@@ -65,6 +65,11 @@ answer. This milestone does not persist it to disk; Session Transcript retention
 belongs to the later Session milestone, and reasoning will not enter long-term
 Memory/RAG.
 
+The v1 Provider boundary is intentionally limited to OpenAI-compatible Chat
+Completions. It does not implement the OpenAI Responses API or Anthropic's native
+Messages protocol; a configured provider must expose a compatible Chat
+Completions endpoint.
+
 Run the TUI with an explicit workspace:
 
 ```bash
