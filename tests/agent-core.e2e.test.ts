@@ -298,6 +298,134 @@ describe("read-only ReAct end-to-end", () => {
     expect(executions).toBe(0);
   });
 
+  it("owns provider cancellation and exposes the run lifecycle", async () => {
+    let markProviderStarted: () => void = () => undefined;
+    const providerStarted = new Promise<void>((resolve) => {
+      markProviderStarted = resolve;
+    });
+    let providerSignal: AbortSignal | undefined;
+    const provider: ModelProvider = {
+      complete: async (_request, options) => {
+        providerSignal = options?.signal;
+        markProviderStarted();
+        return new Promise<ModelResponse>((_resolve, reject) => {
+          const rejectCancelled = () => {
+            reject(
+              options?.signal?.reason ??
+                new DOMException("The request was cancelled.", "AbortError"),
+            );
+          };
+          if (options?.signal?.aborted === true) {
+            rejectCancelled();
+            return;
+          }
+          options?.signal?.addEventListener("abort", rejectCancelled, {
+            once: true,
+          });
+        });
+      },
+    };
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        throw new Error("must not execute");
+      },
+    };
+    const core = new AgentCore(provider, runtime);
+
+    expect(core.state).toEqual({ phase: "idle" });
+    const running = core.run("读取 README.md");
+    await providerStarted;
+
+    expect(core.state).toEqual({ phase: "requesting_model", step: 1 });
+    expect(core.cancel()).toBe(true);
+    expect(core.state).toEqual({ phase: "cancelling", step: 1 });
+    expect(providerSignal?.aborted).toBe(true);
+
+    await expect(running).resolves.toMatchObject({
+      kind: "stopped",
+      reason: "cancelled",
+      steps: 1,
+    });
+    expect(core.state).toEqual({ phase: "settled", outcome: "cancelled" });
+    expect(core.cancel()).toBe(false);
+  });
+
+  it("records an in-flight Read result, then stops before another model request", async () => {
+    let markToolStarted: () => void = () => undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    let releaseTool: () => void = () => undefined;
+    const toolReleased = new Promise<void>((resolve) => {
+      releaseTool = resolve;
+    });
+    let providerRequests = 0;
+    const provider: ModelProvider = {
+      complete: async () => {
+        providerRequests += 1;
+        if (providerRequests > 1) {
+          throw new Error("must stop before another model request");
+        }
+        return {
+          kind: "tool_calls",
+          content: [],
+          calls: [
+            {
+              id: "call-in-flight",
+              name: "read",
+              rawArguments: JSON.stringify({ path: "README.md" }),
+            },
+          ],
+        };
+      },
+    };
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async (call) => {
+        markToolStarted();
+        await toolReleased;
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "success",
+          output: "READ_FINISHED_AFTER_CANCEL",
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime);
+
+    const running = core.run("读取 README.md");
+    await toolStarted;
+
+    expect(core.state).toEqual({
+      phase: "executing_tool",
+      step: 1,
+      toolCallId: "call-in-flight",
+      toolName: "read",
+    });
+    expect(core.cancel()).toBe(true);
+    expect(core.state).toEqual({ phase: "cancelling", step: 1 });
+    releaseTool();
+
+    const result = await running;
+    expect(result).toMatchObject({
+      kind: "stopped",
+      reason: "cancelled",
+      steps: 1,
+    });
+    expect(providerRequests).toBe(1);
+    expect(result.messages.at(-1)).toMatchObject({
+      role: "tool",
+      toolCallId: "call-in-flight",
+      observation: {
+        status: "success",
+        output: "READ_FINISHED_AFTER_CANCEL",
+      },
+    });
+    expect(core.state).toEqual({ phase: "settled", outcome: "cancelled" });
+  });
+
   it("retries only the second model request and preserves the Read Observation", async () => {
     const { workspace } = await createWorkspace();
     await writeFile(join(workspace, "README.md"), "PRESERVED_OBSERVATION\n", "utf8");

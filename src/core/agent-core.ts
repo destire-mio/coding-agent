@@ -14,6 +14,13 @@ import type {
 } from "./contracts.js";
 import { assistantText } from "./contracts.js";
 import {
+  INITIAL_AGENT_RUN_STATE,
+  isAgentRunActive,
+  transitionAgentRunState,
+  type AgentRunState,
+  type AgentRunTransition,
+} from "./agent-run-state.js";
+import {
   asProviderError,
   toProviderFailure,
 } from "./provider-error.js";
@@ -48,6 +55,8 @@ export class AgentCore {
   readonly #maxSteps: number;
   readonly #systemPrompt: string;
   readonly #providerRetry: ProviderRetryPolicy;
+  #runState: AgentRunState = INITIAL_AGENT_RUN_STATE;
+  #activeController: AbortController | undefined;
 
   constructor(
     provider: ModelProvider,
@@ -66,7 +75,28 @@ export class AgentCore {
     this.#providerRetry = resolveProviderRetryPolicy(options.providerRetry);
   }
 
+  get state(): AgentRunState {
+    return this.#runState;
+  }
+
+  cancel(): boolean {
+    const controller = this.#activeController;
+    if (controller === undefined || !isAgentRunActive(this.#runState)) {
+      return false;
+    }
+
+    this.#transition({ type: "cancel" });
+    if (!controller.signal.aborted) {
+      controller.abort(new DOMException("The Agent run was cancelled.", "AbortError"));
+    }
+    return true;
+  }
+
   async run(userInput: string, options: RunOptions = {}): Promise<RunResult> {
+    if (this.#activeController !== undefined) {
+      throw new Error("AgentCore already has an active run.");
+    }
+
     const prompt = userInput.trim();
     const messages: AgentMessage[] = [];
 
@@ -80,10 +110,47 @@ export class AgentCore {
       );
     }
 
+    const controller = new AbortController();
+    this.#transition({ type: "start" });
+    this.#activeController = controller;
+
+    const onExternalAbort = () => {
+      this.cancel();
+    };
+    if (options.signal?.aborted === true) {
+      onExternalAbort();
+    } else {
+      options.signal?.addEventListener("abort", onExternalAbort, { once: true });
+    }
+
+    try {
+      const result = await this.#runLoop(prompt, {
+        signal: controller.signal,
+        ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+      });
+      this.#transition({ type: "settle", outcome: runOutcome(result) });
+      return result;
+    } catch (error) {
+      if (isAgentRunActive(this.#runState)) {
+        this.#transition({ type: "settle", outcome: "failed" });
+      }
+      throw error;
+    } finally {
+      options.signal?.removeEventListener("abort", onExternalAbort);
+      this.#activeController = undefined;
+    }
+  }
+
+  async #runLoop(prompt: string, options: RunOptions): Promise<RunResult> {
+    const messages: AgentMessage[] = [];
     messages.push({ role: "user", content: prompt });
     const seenToolCallIds = new Set<string>();
 
     for (let step = 1; step <= this.#maxSteps; step += 1) {
+      if (isSignalAborted(options.signal)) {
+        return this.#stopped(step - 1, messages, "cancelled", options.onEvent);
+      }
+      this.#transition({ type: "request_model", step });
       const completion = await this.#completeModel(
         {
           systemPrompt: this.#systemPrompt,
@@ -160,7 +227,16 @@ export class AgentCore {
           return this.#stopped(step, messages, "cancelled", options.onEvent);
         }
         seenToolCallIds.add(call.id);
+        this.#transition({
+          type: "execute_tool",
+          step,
+          toolCallId: call.id,
+          toolName: call.name,
+        });
         this.#emit(options.onEvent, { type: "tool_call", step, call });
+        if (isSignalAborted(options.signal)) {
+          return this.#stopped(step, messages, "cancelled", options.onEvent);
+        }
 
         let observation: Observation;
         try {
@@ -192,6 +268,9 @@ export class AgentCore {
           observation,
         });
         this.#emit(options.onEvent, { type: "observation", step, observation });
+        if (isSignalAborted(options.signal)) {
+          return this.#stopped(step, messages, "cancelled", options.onEvent);
+        }
       }
     }
 
@@ -356,6 +435,9 @@ export class AgentCore {
     reason: "max_steps" | "cancelled",
     onEvent: RunOptions["onEvent"],
   ): RunResult {
+    if (reason === "cancelled" && isAgentRunActive(this.#runState)) {
+      this.#transition({ type: "cancel" });
+    }
     this.#emit(onEvent, { type: "stopped", steps, reason });
     return { kind: "stopped", reason, steps, messages: [...messages] };
   }
@@ -396,6 +478,10 @@ export class AgentCore {
       // An observer such as the TUI must never be able to break the Core loop.
     }
   }
+
+  #transition(transition: AgentRunTransition): void {
+    this.#runState = transitionAgentRunState(this.#runState, transition);
+  }
 }
 
 type ModelCompletionOutcome =
@@ -404,4 +490,14 @@ type ModelCompletionOutcome =
 
 function isSignalAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
+}
+
+function runOutcome(result: RunResult) {
+  if (result.kind === "final_answer") {
+    return "completed" as const;
+  }
+  if (result.kind === "failed") {
+    return "failed" as const;
+  }
+  return result.reason;
 }

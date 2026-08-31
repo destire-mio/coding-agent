@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Box, Text, useApp } from "ink";
+import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 
 import type { AgentCore } from "../core/agent-core.js";
@@ -37,6 +37,7 @@ export function AgentApp({
   const { exit } = useApp();
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [running, setRunning] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
   const [completedThinking, setCompletedThinking] = useState<
     CompletedThinking[]
@@ -92,6 +93,7 @@ export function AgentApp({
       }
 
       setRunning(true);
+      setCancelling(false);
       setEvents([]);
       setCompletedThinking([]);
       clearStreamingOutput();
@@ -154,6 +156,7 @@ export function AgentApp({
       });
       setResult(nextResult);
       setRunning(false);
+      setCancelling(false);
       onComplete?.(nextResult);
     },
     [
@@ -163,6 +166,15 @@ export function AgentApp({
       onComplete,
       running,
     ],
+  );
+
+  useInput(
+    (_input, key) => {
+      if (key.escape && core.cancel()) {
+        setCancelling(true);
+      }
+    },
+    { isActive: running },
   );
 
   useEffect(() => {
@@ -204,7 +216,11 @@ export function AgentApp({
         </Box>
       ) : null}
 
-      {running ? <Text color="yellow">running…</Text> : null}
+      {running ? (
+        <Text color="yellow">
+          {cancelling ? "cancelling…" : "running… · Esc to cancel"}
+        </Text>
+      ) : null}
       {completedThinking.map((thinking) => (
         <Text key={thinking.step} color="magenta">
           step {thinking.step} thinking › {thinking.text}

@@ -1,5 +1,6 @@
 export { AgentCore } from "./core/agent-core.js";
 export type { AgentCoreOptions, RunOptions } from "./core/agent-core.js";
+export type { AgentRunOutcome, AgentRunState } from "./core/agent-run-state.js";
 export type {
   AgentMessage,
   AssistantContentPart,

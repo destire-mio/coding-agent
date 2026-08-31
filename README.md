@@ -22,6 +22,19 @@ The model proposes actions; it never reads files directly. Core owns the loop an
 termination. Tool Runtime owns argument validation, permission checks, and tool
 execution.
 
+Core also owns the lifecycle of one active run:
+
+```text
+idle → requesting_model → executing_tool → requesting_model → settled
+                  └──────── Esc/cancel ────────→ cancelling → settled
+```
+
+The TUI only turns Esc into a cancellation request. Core changes the run state
+and aborts the same signal used by the Provider request and retry wait. Runtime
+does not receive a speculative cancellation protocol in this read-only
+milestone. If Read has already started, it may finish and its real Observation
+is retained, but Core stops before another model request.
+
 ## Requirements
 
 - Node.js 22 or newer
@@ -83,6 +96,10 @@ Observation
 
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
+
+AgentRunState
+= Core-owned lifecycle: idle, requesting_model, executing_tool, cancelling,
+  or settled with an outcome
 ```
 
 Expected tool failures such as invalid arguments, missing files, and permission
@@ -126,8 +143,9 @@ Core uses at most 3 attempts per model request, starting with 500 ms exponential
 backoff, up to 25% jitter, a 30-second delay cap, and bounded `Retry-After`
 support. The OpenAI SDK's own retries are disabled so every attempt is visible
 to Core and the TUI. Provider requests have a 60-second timeout. The Core API
-already treats an `AbortSignal` as `stopped: cancelled`; a TUI cancellation key
-is intentionally not part of this milestone yet.
+accepts an external `AbortSignal`, and Core also exposes a cancellation entry
+used by Esc while the TUI is running. Both routes abort the same active run and
+produce `stopped: cancelled`.
 
 ## Verify
 
@@ -153,6 +171,11 @@ The deterministic suite covers:
 - a real local OpenAI-compatible HTTP 429 followed by a visible Core retry;
 - retrying the second model request without repeating a successful Read;
 - cancellation interrupting retry backoff and preventing tool execution;
+- Core state transitions for model requests, tool execution, cancellation, and
+  terminal outcomes;
+- TUI Esc aborting an active Provider request through Core;
+- cancellation during an in-flight Read retaining its completed Observation
+  while preventing the next model request;
 - TUI frames for streamed reasoning, text, and tool arguments;
 - a clean TypeScript build and executable CLI entry point.
 
@@ -191,6 +214,13 @@ stream, and Adapter-owned conversion back to DeepSeek's reasoning field.
 Unlike Kimi's Transcript layer, this milestone retains reasoning only in the
 current run and TUI; disk persistence waits for the Session milestone.
 
+The Agent cancellation design was checked at the same pinned commit against
+Kimi's stateful Agent/TurnFlow lifecycle, stateless loop `AbortSignal`, and Esc
+keyboard tests. This project adopts Agent-owned cancellation and signal
+propagation, but deliberately omits Kimi's Session, dialog, compaction,
+double-Esc exit, and subagent states. Its current Read boundary is cooperative:
+an already-started read completes and records reality, then the Core stops.
+
 ## Current security boundary
 
 - Only the `read` tool is registered.
@@ -209,14 +239,17 @@ current run and TUI; disk persistence waits for the Session milestone.
 
 ## Status
 
-On 2026-08-31, the deterministic suite passed 39 tests across 10 test files. The
+On 2026-08-31, the deterministic suite passed 44 tests across 11 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
 `reasoning_content` is streamed into a generic `think` part and serialized back
 beside the original ToolCall and Read Observation on the next request. Retrying
 the second model request preserves the existing Observation and executes Read
-only once.
+only once. A deterministic Ink TUI trajectory also proves that Esc reaches the
+Core state machine, aborts the Provider signal, and ends as
+`stopped: cancelled`. A separate in-flight Read test proves that its completed
+Observation is retained while the next model request is suppressed.
 
 The real-provider smoke passed with DeepSeek Thinking in two model rounds:
 reasoning and tool-call arguments were streamed, Core retained the tool-call

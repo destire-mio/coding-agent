@@ -115,6 +115,70 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   view.unmount();
 });
 
+it("routes Esc through the Core state machine and cancels the provider request", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-cancel-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  let markProviderStarted: () => void = () => undefined;
+  const providerStarted = new Promise<void>((resolve) => {
+    markProviderStarted = resolve;
+  });
+  let providerWasAborted = false;
+  const provider: ModelProvider = {
+    complete: async (_request, options) => {
+      markProviderStarted();
+      return new Promise<ModelResponse>((_resolve, reject) => {
+        const rejectCancelled = () => {
+          providerWasAborted = true;
+          reject(
+            options?.signal?.reason ??
+              new DOMException("The request was cancelled.", "AbortError"),
+          );
+        };
+        if (options?.signal?.aborted === true) {
+          rejectCancelled();
+          return;
+        }
+        options?.signal?.addEventListener("abort", rejectCancelled, {
+          once: true,
+        });
+      });
+    },
+  };
+  const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="读取 README.md"
+      onComplete={finish}
+    />,
+  );
+
+  await providerStarted;
+  await renderTurn();
+  expect(view.lastFrame()).toContain("running… · Esc to cancel");
+
+  view.stdin.write("\u001B");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result).toMatchObject({ kind: "stopped", reason: "cancelled" });
+  expect(providerWasAborted).toBe(true);
+  expect(core.state).toEqual({ phase: "settled", outcome: "cancelled" });
+  expect(
+    view.frames.some((frame) => frame.includes("stopped: cancelled")),
+  ).toBe(true);
+  view.unmount();
+});
+
 class StreamingScriptedProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
   readonly #responses: Array<ModelResponse | ProviderError>;
