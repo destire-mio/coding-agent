@@ -58,7 +58,7 @@ it("retries a real OpenAI-compatible HTTP 429 visibly through Core", async () =>
     apiKey: "local-test-key",
     model: "deepseek-v4-flash",
     baseURL: `http://127.0.0.1:${address.port}`,
-    thinking: "disabled",
+    thinking: "enabled",
   };
   const provider = new OpenAICompatibleProvider(config);
   const runtime: ToolExecutor = {

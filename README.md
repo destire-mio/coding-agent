@@ -44,10 +44,13 @@ CODING_AGENT_MODEL=deepseek-v4-flash
 CODING_AGENT_BASE_URL=https://api.deepseek.com
 ```
 
-The first milestone deliberately disables DeepSeek thinking mode. DeepSeek V4
-enables thinking by default, but tool-calling conversations must then preserve
-and replay provider-specific `reasoning_content`. That state belongs to the next
-Provider milestone; silently dropping it would break the second model request.
+DeepSeek thinking mode is enabled. The Adapter converts streamed
+`reasoning_content` into provider-neutral `think` parts, Core retains the
+complete assistant message, and the Adapter replays the reasoning on later
+requests in the same run. The TUI renders reasoning separately from the final
+answer. This milestone does not persist it to disk; Session Transcript retention
+belongs to the later Session milestone, and reasoning will not enter long-term
+Memory/RAG.
 
 Run the TUI with an explicit workspace:
 
@@ -72,6 +75,9 @@ node --env-file=.env dist/cli.js \
 ToolCall
 = model proposal: id + tool name + raw arguments
 
+AssistantContentPart
+= provider-neutral text or think content retained by Core
+
 Observation
 = Runtime evidence: matching toolCallId + success/output or error/code
 
@@ -86,15 +92,18 @@ terminate the run instead.
 ## Streaming boundary
 
 Provider stream fragments are drafts, not executable tool calls. The Adapter
-normalizes text and tool-call deltas for the TUI, assembles tool arguments, and
+normalizes thinking, text, and tool-call deltas for the TUI, assembles complete
+assistant content and tool arguments, and
 only returns a `ToolCall` after the provider cleanly finishes with
 `finish_reason: "tool_calls"`. If the stream disconnects, ends without a finish
 reason, or finishes because of truncation, Core returns a Provider failure and
 Tool Runtime is not called.
 
-The TUI coalesces draft updates every 50 ms and keeps a bounded preview, while
-the Adapter preserves the complete response used by Core. This keeps rendering
-responsive without weakening the execution gate.
+The TUI coalesces streaming updates every 50 ms. It keeps bounded text and tool
+argument previews, while successful reasoning is accumulated and retained per
+step in the current TUI trajectory. The Adapter and Core preserve the complete
+response independently of rendering. Partial reasoning from a failed Provider
+attempt is discarded before retrying.
 
 ## Provider failures and retries
 
@@ -133,14 +142,18 @@ The deterministic suite covers:
 - malformed arguments and missing files;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
-- streamed text and fragmented tool arguments being assembled correctly;
+- streamed thinking, text, and fragmented tool arguments being assembled
+  correctly;
+- DeepSeek thinking enabled without unsupported `tool_choice`;
+- a real local OpenAI-compatible HTTP Read trajectory that verifies the second
+  request contains the first response's reasoning, ToolCall, and Observation;
 - interrupted or truncated streams producing a Provider failure with zero tool
   executions;
 - typed 401/429/quota/timeout/5xx/cancellation classification;
 - a real local OpenAI-compatible HTTP 429 followed by a visible Core retry;
 - retrying the second model request without repeating a successful Read;
 - cancellation interrupting retry backoff and preventing tool execution;
-- TUI draft frames for streamed text and tool arguments;
+- TUI frames for streamed reasoning, text, and tool arguments;
 - a clean TypeScript build and executable CLI entry point.
 
 The real-provider smoke is separate because it spends provider quota and requires
@@ -151,8 +164,9 @@ node --env-file=.env --import tsx scripts/real-smoke.ts
 ```
 
 It creates a temporary workspace, requires the real model to call Read, verifies
-the matching Observation, checks that both tool-call and text stream deltas were
-received, and checks that the final answer contains a marker read from the file.
+the matching Observation, checks that thinking, tool-call, and text stream
+deltas were received, verifies that tool-call reasoning was retained by Core,
+and checks that the final answer contains a marker read from the file.
 
 ## Design reference
 
@@ -169,6 +183,14 @@ explainable and testable. It also does not yet persist interrupted turns or
 write a synthetic unexecuted tool result; those belong to later Session and
 recovery milestones.
 
+The Thinking round-trip was separately checked against Kimi Code at pinned
+commit
+[`619564d`](https://github.com/MoonshotAI/kimi-code/tree/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b).
+This project adopts its provider-neutral `think` content, separate thinking
+stream, and Adapter-owned conversion back to DeepSeek's reasoning field.
+Unlike Kimi's Transcript layer, this milestone retains reasoning only in the
+current run and TUI; disk persistence waits for the Session milestone.
+
 ## Current security boundary
 
 - Only the `read` tool is registered.
@@ -177,6 +199,9 @@ recovery milestones.
 - Read accepts regular UTF-8 files up to 128 KiB for this milestone.
 - File contents returned by Read are sent to the configured model provider as an
   Observation. The provider is therefore part of the data trust boundary.
+- Model reasoning may repeat sensitive material from the prompt or Observation.
+  It is displayed in the TUI and retained in the current in-memory `RunResult`,
+  but is not written to the workspace, Git, long-term Memory, or telemetry.
 - Application-level path checks are not an OS sandbox and do not yet defend every
   concurrent filesystem race. Stronger sandboxing is a later milestone.
 - Bash, Edit, MCP, plugins, long-term Session/Memory, multi-agent behavior, and a
@@ -184,18 +209,22 @@ recovery milestones.
 
 ## Status
 
-On 2026-08-30, the deterministic suite passed 36 tests across 9 test files. The
+On 2026-08-31, the deterministic suite passed 39 tests across 10 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
-hidden inside the SDK. It also proves that retrying the second model request
-preserves the existing Observation and executes Read only once.
+hidden inside the SDK. A second real HTTP trajectory proves that
+`reasoning_content` is streamed into a generic `think` part and serialized back
+beside the original ToolCall and Read Observation on the next request. Retrying
+the second model request preserves the existing Observation and executes Read
+only once.
 
-The real-provider smoke passed with DeepSeek in two model rounds: streamed tool-call
-arguments were assembled into Read, Runtime returned a successful matching
-Observation, and streamed final text contained the file's private marker. It
-used 2 Provider attempts with 0 retries. The compiled TUI also completed the
-real README task, displayed `step + attempt`, bounded streaming drafts, and
-`tool call read → observation success → final answer`, then exited normally.
+The real-provider smoke passed with DeepSeek Thinking in two model rounds:
+reasoning and tool-call arguments were streamed, Core retained the tool-call
+reasoning, Runtime returned a successful matching Observation, and streamed
+final text contained the file's private marker. It used 2 Provider attempts
+with 0 retries. The compiled TUI also completed a real `package.json` Read,
+retained `step 1 thinking › ...` in the visible trajectory, and displayed
+`tool call read → observation success → final answer` before exiting normally.
 
 This proves the current minimum chain runs; it does not yet prove the later
 production-strength Provider, sandbox, Session, or recovery milestones.

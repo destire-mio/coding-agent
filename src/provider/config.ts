@@ -2,7 +2,7 @@ export interface ProviderConfig {
   readonly apiKey: string;
   readonly model: string;
   readonly baseURL: string;
-  readonly thinking: "disabled";
+  readonly thinking: "enabled";
 }
 
 export class ConfigurationError extends Error {}
@@ -39,6 +39,6 @@ export function loadProviderConfig(
     apiKey,
     model,
     baseURL: parsedBaseURL.toString().replace(/\/$/, ""),
-    thinking: "disabled",
+    thinking: "enabled",
   };
 }

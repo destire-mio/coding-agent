@@ -4,6 +4,16 @@ export interface ToolCall {
   readonly rawArguments: string;
 }
 
+export type AssistantContentPart =
+  | {
+      readonly type: "text";
+      readonly text: string;
+    }
+  | {
+      readonly type: "think";
+      readonly think: string;
+    };
+
 export interface ToolDefinition {
   readonly name: string;
   readonly description: string;
@@ -37,7 +47,7 @@ export type AgentMessage =
     }
   | {
       readonly role: "assistant";
-      readonly content: string;
+      readonly content: readonly AssistantContentPart[];
       readonly toolCalls: readonly ToolCall[];
     }
   | {
@@ -56,15 +66,19 @@ export interface ModelRequest {
 export type ModelResponse =
   | {
       readonly kind: "final";
-      readonly text: string;
+      readonly content: readonly AssistantContentPart[];
     }
   | {
       readonly kind: "tool_calls";
-      readonly content: string;
+      readonly content: readonly AssistantContentPart[];
       readonly calls: readonly ToolCall[];
     };
 
 export type ModelStreamEvent =
+  | {
+      readonly type: "thinking_delta";
+      readonly delta: string;
+    }
   | {
       readonly type: "text_delta";
       readonly delta: string;
@@ -122,6 +136,12 @@ export type RunEvent =
       readonly step: number;
       readonly attempt: number;
       readonly maxAttempts: number;
+    }
+  | {
+      readonly type: "model_thinking_delta";
+      readonly step: number;
+      readonly attempt: number;
+      readonly delta: string;
     }
   | {
       readonly type: "model_text_delta";
@@ -194,4 +214,20 @@ export type RunResult =
 
 export function observationToModelContent(observation: Observation): string {
   return JSON.stringify(observation);
+}
+
+export function assistantText(
+  content: readonly AssistantContentPart[],
+): string {
+  return content
+    .map((part) => (part.type === "text" ? part.text : ""))
+    .join("");
+}
+
+export function assistantThinking(
+  content: readonly AssistantContentPart[],
+): string {
+  return content
+    .map((part) => (part.type === "think" ? part.think : ""))
+    .join("");
 }

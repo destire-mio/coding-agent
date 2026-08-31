@@ -12,6 +12,7 @@ import type {
   ToolCall,
   ToolExecutor,
 } from "./contracts.js";
+import { assistantText } from "./contracts.js";
 import {
   asProviderError,
   toProviderFailure,
@@ -102,7 +103,7 @@ export class AgentCore {
       }
 
       if (response.kind === "final") {
-        const answer = response.text.trim();
+        const answer = assistantText(response.content).trim();
         if (answer.length === 0) {
           return this.#failed(
             step,
@@ -113,7 +114,11 @@ export class AgentCore {
           );
         }
 
-        messages.push({ role: "assistant", content: answer, toolCalls: [] });
+        messages.push({
+          role: "assistant",
+          content: [...response.content],
+          toolCalls: [],
+        });
         this.#emit(options.onEvent, { type: "final_answer", step, answer });
         return { kind: "final_answer", answer, steps: step, messages: [...messages] };
       }
@@ -313,6 +318,15 @@ export class AgentCore {
       return undefined;
     }
     return (event) => {
+      if (event.type === "thinking_delta") {
+        this.#emit(onEvent, {
+          type: "model_thinking_delta",
+          step,
+          attempt,
+          delta: event.delta,
+        });
+        return;
+      }
       if (event.type === "text_delta") {
         this.#emit(onEvent, {
           type: "model_text_delta",

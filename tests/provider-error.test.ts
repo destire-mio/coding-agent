@@ -14,7 +14,7 @@ describe("OpenAI-compatible provider errors", () => {
       apiKey: "not-sent-by-this-test",
       model: "deepseek-v4-flash",
       baseURL: "https://api.deepseek.com",
-      thinking: "disabled",
+      thinking: "enabled",
     };
 
     expect(buildOpenAIClientOptions(config)).toMatchObject({

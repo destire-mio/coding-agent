@@ -19,7 +19,7 @@ describe("provider configuration", () => {
       apiKey: "test-key",
       model: "deepseek-v4-flash",
       baseURL: "https://api.deepseek.com",
-      thinking: "disabled",
+      thinking: "enabled",
     });
   });
 
@@ -34,7 +34,7 @@ describe("provider configuration", () => {
       apiKey: "test-key",
       model: "deepseek-v4-pro",
       baseURL: "https://provider.example/v1",
-      thinking: "disabled",
+      thinking: "enabled",
     });
   });
 });

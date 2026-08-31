@@ -21,6 +21,7 @@ try {
   const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
   const core = new AgentCore(provider, runtime, { maxSteps: 4 });
   let sawToolCallDelta = false;
+  let sawThinkingDelta = false;
   let sawTextDelta = false;
   let providerAttempts = 0;
   let providerRetries = 0;
@@ -29,6 +30,7 @@ try {
     {
       onEvent: (event) => {
         sawToolCallDelta ||= event.type === "model_tool_call_delta";
+        sawThinkingDelta ||= event.type === "model_thinking_delta";
         sawTextDelta ||= event.type === "model_text_delta";
         providerAttempts += event.type === "model_request" ? 1 : 0;
         providerRetries += event.type === "provider_retry" ? 1 : 0;
@@ -42,6 +44,14 @@ try {
       message.toolName === "read" &&
       message.observation.status === "success",
   );
+  const thinkingToolCall = result.messages.find(
+    (message) =>
+      message.role === "assistant" &&
+      message.toolCalls.length > 0 &&
+      message.content.some(
+        (part) => part.type === "think" && part.think.length > 0,
+      ),
+  );
 
   if (result.kind !== "final_answer") {
     throw new Error(`Expected final_answer, received ${result.kind}.`);
@@ -49,11 +59,18 @@ try {
   if (readObservation === undefined) {
     throw new Error("The real provider did not complete a successful Read call.");
   }
+  if (thinkingToolCall === undefined || !sawThinkingDelta) {
+    throw new Error(
+      "The real provider did not stream and preserve tool-call reasoning.",
+    );
+  }
   if (!result.answer.includes(marker)) {
     throw new Error("The final answer did not preserve the README verification marker.");
   }
   if (!sawToolCallDelta || !sawTextDelta) {
-    throw new Error("The real provider did not expose both tool and text stream deltas.");
+    throw new Error(
+      "The real provider did not expose both tool and text stream deltas.",
+    );
   }
 
   process.stdout.write(
@@ -64,6 +81,7 @@ try {
         tool: "read",
         markerVerified: true,
         streamingVerified: true,
+        thinkingVerified: true,
         providerAttempts,
         providerRetries,
         answer: result.answer,

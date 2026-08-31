@@ -34,7 +34,9 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   const provider = new StreamingScriptedProvider([
     {
       kind: "tool_calls",
-      content: "",
+      content: [
+        { type: "think", think: "I need to inspect README.md." },
+      ],
       calls: [
         {
           id: "call-tui-read",
@@ -44,7 +46,13 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
       ],
     },
     new ProviderError("rate_limit", "slow down", { retryable: true }),
-    { kind: "final", text: "The README contains TUI_E2E_MARKER." },
+    {
+      kind: "final",
+      content: [
+        { type: "think", think: "The Read Observation contains the marker." },
+        { type: "text", text: "The README contains TUI_E2E_MARKER." },
+      ],
+    },
   ]);
   const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
   const core = new AgentCore(provider, runtime, {
@@ -79,6 +87,15 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   expect(view.lastFrame()).toContain(
     "retry provider attempt 2/3 after rate_limit (0ms)",
   );
+  expect(view.lastFrame()).toContain(
+    "step 1 thinking › I need to inspect README.md.",
+  );
+  expect(view.lastFrame()).toContain(
+    "step 2 thinking › The Read Observation contains the marker.",
+  );
+  expect(view.lastFrame()).not.toContain(
+    "partial reasoning from failed attempt",
+  );
   expect(view.lastFrame()).toContain("The README contains TUI_E2E_MARKER.");
   expect(
     view.frames.some((frame) =>
@@ -88,6 +105,11 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   expect(
     view.frames.some((frame) =>
       frame.includes("stream › The README contains TUI_E2E_MARKER."),
+    ),
+  ).toBe(true);
+  expect(
+    view.frames.some((frame) =>
+      frame.includes("thinking › The Read Observation contains the marker."),
     ),
   ).toBe(true);
   view.unmount();
@@ -111,7 +133,20 @@ class StreamingScriptedProvider implements ModelProvider {
       throw new Error("No scripted response remains");
     }
     if (response instanceof ProviderError) {
+      options?.onEvent?.({
+        type: "thinking_delta",
+        delta: "partial reasoning from failed attempt",
+      });
+      await renderTurn(75);
       throw response;
+    }
+    for (const part of response.content) {
+      options?.onEvent?.(
+        part.type === "think"
+          ? { type: "thinking_delta", delta: part.think }
+          : { type: "text_delta", delta: part.text },
+      );
+      await renderTurn(75);
     }
     if (response.kind === "tool_calls") {
       const call = response.calls[0];
@@ -132,9 +167,6 @@ class StreamingScriptedProvider implements ModelProvider {
         });
         await renderTurn();
       }
-    } else {
-      options?.onEvent?.({ type: "text_delta", delta: response.text });
-      await renderTurn(75);
     }
     return response;
   }

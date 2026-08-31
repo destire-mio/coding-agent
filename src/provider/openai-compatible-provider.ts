@@ -2,6 +2,7 @@ import OpenAI, { type APIError } from "openai";
 
 import type {
   AgentMessage,
+  AssistantContentPart,
   ModelCompletionOptions,
   ModelProvider,
   ModelRequest,
@@ -9,7 +10,11 @@ import type {
   ModelStreamEvent,
   ToolCall,
 } from "../core/contracts.js";
-import { observationToModelContent } from "../core/contracts.js";
+import {
+  assistantText,
+  assistantThinking,
+  observationToModelContent,
+} from "../core/contracts.js";
 import {
   ProviderError,
   asProviderError,
@@ -75,7 +80,7 @@ export async function consumeChatCompletionStream(
   stream: AsyncIterable<OpenAI.Chat.Completions.ChatCompletionChunk>,
   onEvent?: (event: ModelStreamEvent) => void,
 ): Promise<ModelResponse> {
-  let content = "";
+  const content: AssistantContentPart[] = [];
   let finishReason: string | undefined;
   const toolCallsByIndex = new Map<number, BufferedToolCall>();
 
@@ -100,13 +105,25 @@ export async function consumeChatCompletionStream(
           finishReason = choice.finish_reason;
         }
 
+        const thinkingDelta = deepSeekReasoningDelta(choice.delta);
+        if (thinkingDelta !== undefined && thinkingDelta.length > 0) {
+          appendAssistantContent(content, {
+            type: "think",
+            think: thinkingDelta,
+          });
+          emitStreamEvent(onEvent, {
+            type: "thinking_delta",
+            delta: thinkingDelta,
+          });
+        }
+
         const textDelta = choice.delta.content;
         if (
           textDelta !== undefined &&
           textDelta !== null &&
           textDelta.length > 0
         ) {
-          content += textDelta;
+          appendAssistantContent(content, { type: "text", text: textDelta });
           emitStreamEvent(onEvent, { type: "text_delta", delta: textDelta });
         }
 
@@ -206,7 +223,7 @@ export async function consumeChatCompletionStream(
         };
       });
 
-    return { kind: "tool_calls", content, calls };
+    return { kind: "tool_calls", content: [...content], calls };
   }
 
   if (finishReason !== "stop") {
@@ -221,7 +238,46 @@ export async function consumeChatCompletionStream(
     );
   }
 
-  return { kind: "final", text: content };
+  return { kind: "final", content: [...content] };
+}
+
+function deepSeekReasoningDelta(
+  delta: OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta,
+): string | undefined {
+  const value = (delta as unknown as Record<string, unknown>)[
+    "reasoning_content"
+  ];
+  if (value === undefined || value === null) {
+    return undefined;
+  }
+  if (typeof value !== "string") {
+    throw invalidProviderResponse(
+      "The provider returned non-text reasoning content.",
+    );
+  }
+  return value;
+}
+
+function appendAssistantContent(
+  content: AssistantContentPart[],
+  next: AssistantContentPart,
+): void {
+  const previous = content.at(-1);
+  if (previous?.type === "text" && next.type === "text") {
+    content[content.length - 1] = {
+      type: "text",
+      text: previous.text + next.text,
+    };
+    return;
+  }
+  if (previous?.type === "think" && next.type === "think") {
+    content[content.length - 1] = {
+      type: "think",
+      think: previous.think + next.think,
+    };
+    return;
+  }
+  content.push(next);
 }
 
 export function normalizeOpenAICompatibleError(
@@ -356,7 +412,7 @@ function emitStreamEvent(
 
 type CompatibleChatCompletionRequest =
   OpenAI.Chat.Completions.ChatCompletionCreateParamsStreaming & {
-    readonly thinking: { readonly type: "disabled" };
+    readonly thinking: { readonly type: "enabled" };
   };
 
 export function buildChatCompletionRequest(
@@ -377,7 +433,6 @@ export function buildChatCompletionRequest(
         parameters: tool.inputSchema,
       },
     })),
-    tool_choice: "auto",
     stream: true,
     thinking: { type: config.thinking },
   };
@@ -392,7 +447,10 @@ function toOpenAIMessage(
     case "assistant":
       return {
         role: "assistant",
-        content: message.content || null,
+        content: assistantText(message.content) || null,
+        ...(assistantThinking(message.content).length === 0
+          ? {}
+          : { reasoning_content: assistantThinking(message.content) }),
         ...(message.toolCalls.length === 0
           ? {}
           : {

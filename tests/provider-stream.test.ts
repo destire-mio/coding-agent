@@ -6,6 +6,7 @@ import { consumeChatCompletionStream } from "../src/provider/openai-compatible-p
 
 type Chunk = OpenAI.Chat.Completions.ChatCompletionChunk;
 type Delta = OpenAI.Chat.Completions.ChatCompletionChunk.Choice.Delta;
+type DeepSeekDelta = Delta & { readonly reasoning_content?: unknown };
 type FinishReason =
   OpenAI.Chat.Completions.ChatCompletionChunk.Choice["finish_reason"];
 
@@ -15,6 +16,7 @@ describe("OpenAI-compatible provider streaming", () => {
     const response = await consumeChatCompletionStream(
       chunks(
         chunk({
+          reasoning_content: "I should read the file. ",
           tool_calls: [
             {
               index: 0,
@@ -25,6 +27,7 @@ describe("OpenAI-compatible provider streaming", () => {
           ],
         }),
         chunk({
+          reasoning_content: "The path is safe.",
           tool_calls: [
             {
               index: 0,
@@ -39,7 +42,12 @@ describe("OpenAI-compatible provider streaming", () => {
 
     expect(response).toEqual({
       kind: "tool_calls",
-      content: "",
+      content: [
+        {
+          type: "think",
+          think: "I should read the file. The path is safe.",
+        },
+      ],
       calls: [
         {
           id: "call-stream-read",
@@ -50,11 +58,19 @@ describe("OpenAI-compatible provider streaming", () => {
     });
     expect(events).toEqual([
       {
+        type: "thinking_delta",
+        delta: "I should read the file. ",
+      },
+      {
         type: "tool_call_delta",
         index: 0,
         id: "call-stream-read",
         name: "read",
         argumentsDelta: '{"pa',
+      },
+      {
+        type: "thinking_delta",
+        delta: "The path is safe.",
       },
       {
         type: "tool_call_delta",
@@ -71,10 +87,39 @@ describe("OpenAI-compatible provider streaming", () => {
       (event) => events.push(event),
     );
 
-    expect(response).toEqual({ kind: "final", text: "Hello world" });
+    expect(response).toEqual({
+      kind: "final",
+      content: [{ type: "text", text: "Hello world" }],
+    });
     expect(events).toEqual([
       { type: "text_delta", delta: "Hello" },
       { type: "text_delta", delta: " world" },
+    ]);
+  });
+
+  it("assembles and streams DeepSeek reasoning separately from visible text", async () => {
+    const events: ModelStreamEvent[] = [];
+    const response = await consumeChatCompletionStream(
+      chunks(
+        chunk({ reasoning_content: "first " }),
+        chunk({ reasoning_content: "reason" }),
+        chunk({ content: "answer" }),
+        chunk({}, "stop"),
+      ),
+      (event) => events.push(event),
+    );
+
+    expect(response).toEqual({
+      kind: "final",
+      content: [
+        { type: "think", think: "first reason" },
+        { type: "text", text: "answer" },
+      ],
+    });
+    expect(events).toEqual([
+      { type: "thinking_delta", delta: "first " },
+      { type: "thinking_delta", delta: "reason" },
+      { type: "text_delta", delta: "answer" },
     ]);
   });
 
@@ -126,7 +171,7 @@ describe("OpenAI-compatible provider streaming", () => {
   });
 });
 
-function chunk(delta: Delta, finishReason: FinishReason = null): Chunk {
+function chunk(delta: DeepSeekDelta, finishReason: FinishReason = null): Chunk {
   return {
     id: "chatcmpl-stream-test",
     choices: [{ index: 0, delta, finish_reason: finishReason }],

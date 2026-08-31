@@ -23,6 +23,11 @@ interface StreamingToolDraft {
   readonly argumentsText: string;
 }
 
+interface CompletedThinking {
+  readonly step: number;
+  readonly text: string;
+}
+
 export function AgentApp({
   core,
   workspace,
@@ -33,24 +38,51 @@ export function AgentApp({
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [running, setRunning] = useState(false);
   const [events, setEvents] = useState<string[]>([]);
+  const [completedThinking, setCompletedThinking] = useState<
+    CompletedThinking[]
+  >([]);
+  const [streamingThinking, setStreamingThinking] = useState("");
   const [streamingText, setStreamingText] = useState("");
   const [streamingToolDrafts, setStreamingToolDrafts] = useState<
     StreamingToolDraft[]
   >([]);
   const pendingStreamingText = useRef("");
+  const pendingStreamingThinking = useRef("");
   const textFlushTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
+    undefined,
+  );
+  const thinkingFlushTimer = useRef<ReturnType<typeof setTimeout> | undefined>(
     undefined,
   );
   const [result, setResult] = useState<RunResult>();
   const autoStarted = useRef(false);
 
-  const clearStreamingText = useCallback(() => {
+  const clearStreamingOutput = useCallback(() => {
     pendingStreamingText.current = "";
+    pendingStreamingThinking.current = "";
     if (textFlushTimer.current !== undefined) {
       clearTimeout(textFlushTimer.current);
       textFlushTimer.current = undefined;
     }
+    if (thinkingFlushTimer.current !== undefined) {
+      clearTimeout(thinkingFlushTimer.current);
+      thinkingFlushTimer.current = undefined;
+    }
     setStreamingText("");
+    setStreamingThinking("");
+  }, []);
+
+  const completeStreamingThinking = useCallback((step: number) => {
+    const text = pendingStreamingThinking.current;
+    if (thinkingFlushTimer.current !== undefined) {
+      clearTimeout(thinkingFlushTimer.current);
+      thinkingFlushTimer.current = undefined;
+    }
+    pendingStreamingThinking.current = "";
+    setStreamingThinking("");
+    if (text.length > 0) {
+      setCompletedThinking((current) => [...current, { step, text }]);
+    }
   }, []);
 
   const submit = useCallback(
@@ -61,7 +93,8 @@ export function AgentApp({
 
       setRunning(true);
       setEvents([]);
-      clearStreamingText();
+      setCompletedThinking([]);
+      clearStreamingOutput();
       setStreamingToolDrafts([]);
       const nextResult = await core.run(value, {
         onEvent: (event) => {
@@ -69,8 +102,17 @@ export function AgentApp({
             event.type === "model_request" ||
             event.type === "provider_retry"
           ) {
-            clearStreamingText();
+            clearStreamingOutput();
             setStreamingToolDrafts([]);
+          } else if (event.type === "model_thinking_delta") {
+            pendingStreamingThinking.current += event.delta;
+            if (thinkingFlushTimer.current === undefined) {
+              thinkingFlushTimer.current = setTimeout(() => {
+                thinkingFlushTimer.current = undefined;
+                setStreamingThinking(pendingStreamingThinking.current);
+              }, STREAMING_UI_FLUSH_MS);
+            }
+            return;
           } else if (event.type === "model_text_delta") {
             pendingStreamingText.current = (
               pendingStreamingText.current + event.delta
@@ -89,11 +131,18 @@ export function AgentApp({
             return;
           } else if (
             event.type === "tool_call" ||
-            event.type === "final_answer" ||
-            event.type === "stopped" ||
-            event.type === "failed"
+            event.type === "final_answer"
           ) {
-            clearStreamingText();
+            completeStreamingThinking(event.step);
+            pendingStreamingText.current = "";
+            if (textFlushTimer.current !== undefined) {
+              clearTimeout(textFlushTimer.current);
+              textFlushTimer.current = undefined;
+            }
+            setStreamingText("");
+            setStreamingToolDrafts([]);
+          } else if (event.type === "stopped" || event.type === "failed") {
+            clearStreamingOutput();
             setStreamingToolDrafts([]);
           }
 
@@ -107,7 +156,13 @@ export function AgentApp({
       setRunning(false);
       onComplete?.(nextResult);
     },
-    [clearStreamingText, core, onComplete, running],
+    [
+      clearStreamingOutput,
+      completeStreamingThinking,
+      core,
+      onComplete,
+      running,
+    ],
   );
 
   useEffect(() => {
@@ -128,6 +183,9 @@ export function AgentApp({
       if (textFlushTimer.current !== undefined) {
         clearTimeout(textFlushTimer.current);
       }
+      if (thinkingFlushTimer.current !== undefined) {
+        clearTimeout(thinkingFlushTimer.current);
+      }
     },
     [],
   );
@@ -147,6 +205,14 @@ export function AgentApp({
       ) : null}
 
       {running ? <Text color="yellow">running…</Text> : null}
+      {completedThinking.map((thinking) => (
+        <Text key={thinking.step} color="magenta">
+          step {thinking.step} thinking › {thinking.text}
+        </Text>
+      ))}
+      {streamingThinking.length > 0 ? (
+        <Text color="magenta">thinking › {streamingThinking}</Text>
+      ) : null}
       {streamingText.length > 0 ? (
         <Text dimColor>stream › {streamingText}</Text>
       ) : null}
@@ -210,6 +276,7 @@ function describeEvent(event: RunEvent): string | undefined {
   switch (event.type) {
     case "model_request":
       return `step ${event.step}: model request (attempt ${event.attempt}/${event.maxAttempts})`;
+    case "model_thinking_delta":
     case "model_text_delta":
     case "model_tool_call_delta":
       return undefined;

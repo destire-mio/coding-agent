@@ -35,7 +35,9 @@ describe("read-only ReAct end-to-end", () => {
     const provider = new ScriptedProvider([
       {
         kind: "tool_calls",
-        content: "",
+        content: [
+          { type: "think", think: "I need to read the real README first." },
+        ],
         calls: [
           {
             id: "call-readme",
@@ -44,7 +46,16 @@ describe("read-only ReAct end-to-end", () => {
           },
         ],
       },
-      { kind: "final", text: "The README describes a demo with E2E_MARKER." },
+      {
+        kind: "final",
+        content: [
+          { type: "think", think: "The Observation contains the marker." },
+          {
+            type: "text",
+            text: "The README describes a demo with E2E_MARKER.",
+          },
+        ],
+      },
     ]);
     const core = new AgentCore(provider, runtime, { maxSteps: 4 });
 
@@ -55,6 +66,19 @@ describe("read-only ReAct end-to-end", () => {
     expect(provider.requests).toHaveLength(2);
     const secondRequest = provider.requests[1];
     expect(secondRequest).toBeDefined();
+    expect(secondRequest?.messages).toContainEqual({
+      role: "assistant",
+      content: [
+        { type: "think", think: "I need to read the real README first." },
+      ],
+      toolCalls: [
+        {
+          id: "call-readme",
+          name: "read",
+          rawArguments: JSON.stringify({ path: "README.md" }),
+        },
+      ],
+    });
     const toolMessage = secondRequest?.messages.at(-1);
     expect(toolMessage?.role).toBe("tool");
     if (toolMessage?.role === "tool") {
@@ -71,7 +95,7 @@ describe("read-only ReAct end-to-end", () => {
     const provider = new ScriptedProvider([
       {
         kind: "tool_calls",
-        content: "",
+        content: [],
         calls: [
           {
             id: "call-denied",
@@ -82,7 +106,12 @@ describe("read-only ReAct end-to-end", () => {
       },
       {
         kind: "final",
-        text: "I cannot read that file because it is outside the workspace.",
+        content: [
+          {
+            type: "text",
+            text: "I cannot read that file because it is outside the workspace.",
+          },
+        ],
       },
     ]);
     const core = new AgentCore(provider, runtime);
@@ -149,7 +178,10 @@ describe("read-only ReAct end-to-end", () => {
             retryable: true,
           });
         }
-        return { kind: "final", text: "recovered" };
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "recovered" }],
+        };
       },
     };
     const runtime: ToolExecutor = {
@@ -233,7 +265,7 @@ describe("read-only ReAct end-to-end", () => {
         controller.abort();
         return {
           kind: "tool_calls",
-          content: "",
+          content: [],
           calls: [
             {
               id: "call-after-cancel",
@@ -285,7 +317,9 @@ describe("read-only ReAct end-to-end", () => {
         if (requests.length === 1) {
           return {
             kind: "tool_calls",
-            content: "",
+            content: [
+              { type: "think", think: "Read the file once, then wait." },
+            ],
             calls: [
               {
                 id: "call-preserved-read",
@@ -300,7 +334,10 @@ describe("read-only ReAct end-to-end", () => {
             retryable: true,
           });
         }
-        return { kind: "final", text: "PRESERVED_OBSERVATION" };
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "PRESERVED_OBSERVATION" }],
+        };
       },
     };
     const core = new AgentCore(provider, runtime, {
@@ -316,6 +353,9 @@ describe("read-only ReAct end-to-end", () => {
       requests[2]?.messages.at(-1),
     );
     expect(JSON.stringify(requests[2])).toContain("PRESERVED_OBSERVATION");
+    expect(JSON.stringify(requests[2])).toContain(
+      "Read the file once, then wait.",
+    );
   });
 
   it("never executes a partial streamed ToolCall after provider failure", async () => {
@@ -400,7 +440,7 @@ class RepeatingReadProvider implements ModelProvider {
     this.requests.push(request);
     return {
       kind: "tool_calls",
-      content: "",
+      content: [],
       calls: [
         {
           id: `call-${this.requests.length}`,
