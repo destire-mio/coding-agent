@@ -5,25 +5,34 @@ import { join } from "node:path";
 import { AgentCore } from "../src/core/agent-core.js";
 import { loadProviderConfig } from "../src/provider/config.js";
 import { OpenAICompatibleProvider } from "../src/provider/openai-compatible-provider.js";
+import { GrepTool } from "../src/runtime/grep-tool.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
-const marker = "CODING_AGENT_REAL_READ_SMOKE_2026_08_30";
-const workspace = await mkdtemp(join(tmpdir(), "coding-agent-real-smoke-"));
-const readmeContent = [
-  "# Real provider smoke\n",
-  "This file proves bounded Read paging.\n",
-  "The verification marker is on the next page.\n",
-  `Marker: ${marker}\n`,
-].join("");
+const marker = "CODING_AGENT_REAL_GREP_SMOKE_2026_08_31";
+const secretMarker = "GREP_MUST_NOT_EXPOSE_ENV_SECRET";
+const workspace = await mkdtemp(join(tmpdir(), "coding-agent-real-grep-"));
 
 try {
-  await writeFile(join(workspace, "README.md"), readmeContent, "utf8");
+  await writeFile(
+    join(workspace, "app.log"),
+    [
+      "INFO service ready",
+      "ERROR unrelated failure",
+      `ERROR marker ${marker}`,
+      "",
+    ].join("\n"),
+    "utf8",
+  );
+  await writeFile(
+    join(workspace, ".env"),
+    `ERROR secret ${secretMarker}\n`,
+    "utf8",
+  );
 
   const provider = new OpenAICompatibleProvider(loadProviderConfig());
-  const runtime = await ToolRuntime.readOnly({
-    workspaceRoot: workspace,
-    maxReadBytes: 96,
-  });
+  const runtime = new ToolRuntime([
+    await GrepTool.create({ workspaceRoot: workspace, maxMatches: 1 }),
+  ]);
   const core = new AgentCore(provider, runtime, { maxSteps: 4 });
   let sawToolCallDelta = false;
   let sawThinkingDelta = false;
@@ -31,7 +40,7 @@ try {
   let providerAttempts = 0;
   let providerRetries = 0;
   const result = await core.run(
-    "Use only the read tool, not grep, to read all of README.md. If a page says complete=false, call read again with the same path and copy the exact returned nextCursor value unchanged into the cursor argument. Continue until complete=true, then summarize the complete file and include its exact marker.",
+    "Use grep with the regular expression ^ERROR to search the whole workspace. If complete=false, call grep again with the same pattern, omit path again, and pass the exact nextCursor. Continue until complete=true. Then report the exact CODING_AGENT marker from all safe matches. Never guess it.",
     {
       onEvent: (event) => {
         sawToolCallDelta ||= event.type === "model_tool_call_delta";
@@ -43,41 +52,47 @@ try {
     },
   );
 
-  const readPages: Array<{
-    readonly content: string;
+  const pages: Array<{
+    readonly texts: readonly string[];
     readonly complete: boolean;
     readonly nextCursor?: string;
   }> = [];
-  let rejectedCursors = 0;
   for (const message of result.messages) {
-    if (message.role !== "tool" || message.toolName !== "read") {
+    if (message.role !== "tool" || message.toolName !== "grep") {
       continue;
     }
     if (message.observation.status !== "success") {
-      if (message.observation.error.code === "invalid_cursor") {
-        rejectedCursors += 1;
-        continue;
-      }
       throw new Error(
-        `The real provider produced unexpected Read error ${message.observation.error.code}: ${message.observation.error.message}`,
+        `The real provider produced Grep error ${message.observation.error.code}: ${message.observation.error.message}`,
       );
     }
     const output = message.observation.output;
     if (typeof output !== "object" || output === null) {
-      throw new Error("Read did not return a structured page.");
+      throw new Error("Grep did not return a structured page.");
     }
     const page = output as Record<string, unknown>;
-    if (typeof page["content"] !== "string" || typeof page["complete"] !== "boolean") {
-      throw new Error("Read page omitted content or completion state.");
+    if (!Array.isArray(page["matches"]) || typeof page["complete"] !== "boolean") {
+      throw new Error("Grep page omitted matches or completion state.");
     }
-    readPages.push({
-      content: page["content"],
+    const texts = page["matches"].map((match) => {
+      if (
+        typeof match !== "object" ||
+        match === null ||
+        typeof (match as Record<string, unknown>)["text"] !== "string"
+      ) {
+        throw new Error("Grep returned an invalid match record.");
+      }
+      return (match as Record<string, unknown>)["text"] as string;
+    });
+    pages.push({
+      texts,
       complete: page["complete"],
       ...(typeof page["nextCursor"] === "string"
         ? { nextCursor: page["nextCursor"] }
         : {}),
     });
   }
+
   const thinkingToolCall = result.messages.find(
     (message) =>
       message.role === "assistant" &&
@@ -86,21 +101,24 @@ try {
         (part) => part.type === "think" && part.think.length > 0,
       ),
   );
-
   if (result.kind !== "final_answer") {
     throw new Error(`Expected final_answer, received ${result.kind}.`);
   }
-  if (readPages.length < 2) {
-    throw new Error("The real provider did not continue the bounded Read.");
+  if (pages.length < 2) {
+    throw new Error("The real provider did not continue the bounded Grep.");
   }
-  if (readPages[0]?.complete !== false || readPages[0]?.nextCursor === undefined) {
-    throw new Error("The first Read page did not expose a continuation cursor.");
+  if (pages[0]?.complete !== false || pages[0]?.nextCursor === undefined) {
+    throw new Error("The first Grep page did not expose a continuation cursor.");
   }
-  if (readPages.at(-1)?.complete !== true) {
-    throw new Error("The real provider did not reach the final Read page.");
+  if (pages.at(-1)?.complete !== true) {
+    throw new Error("The real provider did not reach the final Grep page.");
   }
-  if (readPages.map((page) => page.content).join("") !== readmeContent) {
-    throw new Error("The bounded Read pages did not reconstruct README.md exactly.");
+  const observationText = JSON.stringify(pages);
+  if (!observationText.includes(marker)) {
+    throw new Error("The Grep pages did not contain the safe marker.");
+  }
+  if (observationText.includes(secretMarker) || result.answer.includes(secretMarker)) {
+    throw new Error("Grep exposed a sensitive .env match.");
   }
   if (thinkingToolCall === undefined || !sawThinkingDelta) {
     throw new Error(
@@ -108,7 +126,7 @@ try {
     );
   }
   if (!result.answer.includes(marker)) {
-    throw new Error("The final answer did not preserve the README verification marker.");
+    throw new Error("The final answer omitted the Grep verification marker.");
   }
   if (!sawToolCallDelta || !sawTextDelta) {
     throw new Error(
@@ -121,10 +139,10 @@ try {
       {
         status: "passed",
         steps: result.steps,
-        tool: "read",
-        readPages: readPages.length,
-        rejectedCursors,
+        tool: "grep",
+        grepPages: pages.length,
         pagingVerified: true,
+        sensitiveFilteringVerified: true,
         markerVerified: true,
         streamingVerified: true,
         thinkingVerified: true,

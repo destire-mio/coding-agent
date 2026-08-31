@@ -2,8 +2,10 @@ import type {
   Observation,
   ToolCall,
   ToolDefinition,
+  ToolExecutionOptions,
   ToolExecutor,
 } from "../core/contracts.js";
+import { GrepTool } from "./grep-tool.js";
 import { ReadTool, type ReadToolOptions } from "./read-tool.js";
 import type { RuntimeTool } from "./tool.js";
 
@@ -22,14 +24,20 @@ export class ToolRuntime implements ToolExecutor {
   }
 
   static async readOnly(options: ReadToolOptions): Promise<ToolRuntime> {
-    return new ToolRuntime([await ReadTool.create(options)]);
+    return new ToolRuntime([
+      await ReadTool.create(options),
+      await GrepTool.create({ workspaceRoot: options.workspaceRoot }),
+    ]);
   }
 
   definitions(): readonly ToolDefinition[] {
     return [...this.#tools.values()].map((tool) => tool.definition);
   }
 
-  async execute(call: ToolCall): Promise<Observation> {
+  async execute(
+    call: ToolCall,
+    options: ToolExecutionOptions = {},
+  ): Promise<Observation> {
     const tool = this.#tools.get(call.name);
     if (tool === undefined) {
       return errorObservation(
@@ -51,7 +59,7 @@ export class ToolRuntime implements ToolExecutor {
     }
 
     try {
-      const outcome = await tool.execute(input);
+      const outcome = await tool.execute(input, options);
       if (outcome.status === "success") {
         return {
           toolCallId: call.id,

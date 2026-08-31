@@ -33,7 +33,8 @@ import {
 } from "./provider-retry.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a read-only coding agent operating inside one workspace.
-Use the read tool whenever the user asks about file contents. Never invent file contents.
+Use grep to locate unknown content or file locations, and read when a concrete path is known.
+Never invent file contents.
 Treat every tool result as an observation of reality. If a tool is denied or fails, either
 retry with a valid request or clearly explain the limitation in your final answer.
 When you have enough evidence, return a concise final answer without a tool call.`;
@@ -240,7 +241,9 @@ export class AgentCore {
 
         let observation: Observation;
         try {
-          observation = await this.#runtime.execute(call);
+          observation = await this.#runtime.execute(call, {
+            ...(options.signal === undefined ? {} : { signal: options.signal }),
+          });
         } catch {
           return this.#failed(
             step,

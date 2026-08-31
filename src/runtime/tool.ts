@@ -1,4 +1,8 @@
-import type { ToolDefinition, ToolError } from "../core/contracts.js";
+import type {
+  ToolDefinition,
+  ToolError,
+  ToolExecutionOptions,
+} from "../core/contracts.js";
 
 export type ToolOutcome =
   | { readonly status: "success"; readonly output: unknown }
@@ -6,7 +10,7 @@ export type ToolOutcome =
 
 export interface RuntimeTool {
   readonly definition: ToolDefinition;
-  execute(input: unknown): Promise<ToolOutcome>;
+  execute(input: unknown, options?: ToolExecutionOptions): Promise<ToolOutcome>;
 }
 
 export function toolError(

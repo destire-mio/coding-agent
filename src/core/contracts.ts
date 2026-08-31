@@ -127,7 +127,11 @@ export interface ModelProvider {
 
 export interface ToolExecutor {
   definitions(): readonly ToolDefinition[];
-  execute(call: ToolCall): Promise<Observation>;
+  execute(call: ToolCall, options?: ToolExecutionOptions): Promise<Observation>;
+}
+
+export interface ToolExecutionOptions {
+  readonly signal?: AbortSignal;
 }
 
 export type RunEvent =

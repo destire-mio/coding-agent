@@ -31,6 +31,14 @@ and bound to that path, so model-edited or cross-file cursors fail instead of
 silently skipping content. A single line longer than the page limit is continued
 on a UTF-8 character boundary instead of being silently discarded.
 
+Grep locates unknown content with ripgrep regular expressions. It accepts an
+optional workspace-relative file or directory, searches the whole workspace
+when path is omitted, and returns bounded structured matches. Pagination is a
+live re-search: `nextCursor` is integrity-protected and binds the pattern, path,
+and result offset, but files changing between calls may still cause repeated or
+missed matches. Grep always filters sensitive files and VCS metadata. A timeout
+discards partial matches and returns `search_timeout`.
+
 Core also owns the lifecycle of one active run:
 
 ```text
@@ -39,15 +47,16 @@ idle → requesting_model → executing_tool → requesting_model → settled
 ```
 
 The TUI only turns Esc into a cancellation request. Core changes the run state
-and aborts the same signal used by the Provider request and retry wait. Runtime
-does not receive a speculative cancellation protocol in this read-only
-milestone. If Read has already started, it may finish and its real Observation
-is retained, but Core stops before another model request.
+and aborts the same signal used by the Provider request, retry wait, and Runtime.
+If Read has already started, it ignores the signal, may finish, and retains its
+real Observation before Core stops. Grep consumes the signal and terminates its
+fixed ripgrep process before returning a cancelled Observation.
 
 ## Requirements
 
 - Node.js 22 or newer
 - npm
+- ripgrep (`rg`) available on `PATH`
 - A DeepSeek API key
 
 ## Install
@@ -110,6 +119,9 @@ Observation
 
 Read page output
 = content + page byte count/line metadata + complete + optional nextCursor
+
+Grep page output
+= pattern + path + bounded matches(path/line/text) + complete + optional nextCursor
 
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
@@ -187,6 +199,9 @@ The deterministic suite covers:
 - bounded Read continuation across multiple pages, exact reconstruction of one
   oversized UTF-8 line, malformed/tampered/cross-file cursors, and file-change
   rejection;
+- ripgrep regular expressions, live Grep pagination, bounded long-line previews,
+  empty matches, signed cursor rejection, workspace escapes, sensitive-file
+  filtering, unavailable ripgrep, timeout, and cancellation;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
@@ -204,8 +219,8 @@ The deterministic suite covers:
 - Core state transitions for model requests, tool execution, cancellation, and
   terminal outcomes;
 - TUI Esc aborting an active Provider request through Core;
-- cancellation during an in-flight Read retaining its completed Observation
-  while preventing the next model request;
+- cancellation during an in-flight Read retaining its completed Observation,
+  while cancellation during Grep reaches Runtime and terminates ripgrep;
 - TUI frames for streamed reasoning, text, and tool arguments;
 - a clean TypeScript build and executable CLI entry point.
 
@@ -214,13 +229,17 @@ credentials:
 
 ```bash
 node --env-file=.env --import tsx scripts/real-smoke.ts
+node --env-file=.env --import tsx scripts/real-grep-smoke.ts
 ```
 
-It creates a temporary workspace whose marker exists only on the second Read
-page. The smoke requires the real model to follow `nextCursor`, verifies that
-all successful Observations reconstruct the file exactly, checks thinking,
-tool-call, and text stream deltas, verifies tool-call reasoning retention, and
-requires the final answer to contain the second-page marker.
+The Read smoke creates a temporary workspace whose marker exists only on the
+second page. It requires the real model to follow `nextCursor` and verifies exact
+file reconstruction. A model-edited cursor must be rejected; the smoke permits
+the model to correct that error only if later successful pages still reconstruct
+the file exactly. The Grep smoke puts its safe marker on the second match and a
+forbidden marker in `.env`; it requires live pagination and verifies the
+sensitive match never reaches the model. Both smokes check thinking, tool-call,
+and text stream deltas and require the final answer to contain the safe marker.
 
 ## Design reference
 
@@ -257,17 +276,31 @@ Read paging was also compared at pinned commit `619564d`, specifically
 and bytes and continues with `line_offset`, but truncates an oversized single
 line for model display. This project keeps the bounded-call principle and uses a
 Runtime-issued byte cursor so even one oversized UTF-8 line can be continued
-without silent content loss. Grep remains a separate later tool.
+without silent content loss.
+
+Grep was compared against the same pinned commit at
+`packages/agent-core-v2/src/agent/tools/os/grep/`. Both implementations execute a
+fixed ripgrep binary without a shell, apply workspace and sensitive-file policy,
+bound output, and page by re-running the current search. Kimi exposes a raw
+`offset` plus glob, type, context, multiline, and output-mode controls. This
+project keeps only `pattern`, `path`, and a Runtime-signed cursor. It also treats
+timeout as a whole-call error instead of returning Kimi-style partial results.
 
 ## Current security boundary
 
-- Only the `read` tool is registered.
+- Only the read-only `read` and `grep` tools are registered.
 - Read accepts a relative path, canonicalizes it, and rejects paths or symlinks
   resolving outside the workspace.
 - Read accepts regular UTF-8 files and returns at most 128 KiB per call. Larger
   files continue through `nextCursor`; stale cursors fail with `file_changed`.
-- File contents returned by Read are sent to the configured model provider as an
-  Observation. The provider is therefore part of the data trust boundary.
+- Grep executes the fixed `rg` program without a shell, accepts only relative
+  workspace paths, does not follow escaping symlinks, and skips `.env` variants,
+  common private-key names, cloud credential files, and VCS metadata. Safe
+  example files such as `.env.example` remain searchable.
+- File contents returned by Read or Grep are sent to the configured model
+  provider as an Observation. The provider is therefore part of the data trust
+  boundary. Grep filtering does not prevent an explicit Read of a sensitive
+  workspace file under the current Read policy.
 - Model reasoning may repeat sensitive material from the prompt or Observation.
   It is displayed in the TUI and retained in the current in-memory `RunResult`,
   but is not written to the workspace, Git, long-term Memory, or telemetry.
@@ -278,7 +311,7 @@ without silent content loss. Grep remains a separate later tool.
 
 ## Status
 
-On 2026-08-31, the deterministic suite passed 52 tests across 11 test files. The
+On 2026-08-31, the deterministic suite passed 75 tests across 12 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -291,12 +324,15 @@ and sequential multi-call scheduling. A deterministic Ink TUI trajectory also
 proves that Esc reaches the Core state machine, aborts the Provider signal, and
 ends as `stopped: cancelled`. A separate in-flight Read test proves that its
 completed Observation is retained while the next model request is suppressed.
+Grep tests cover real ripgrep regex execution, bounded live pagination, signed
+cursors, workspace and sensitive-file policy, long-line previews, timeout with
+partial-result discard, and Runtime cancellation of the fixed ripgrep process.
 
-The real-provider smoke passed with DeepSeek Thinking in two model rounds:
-reasoning and tool-call arguments were streamed, Core retained the tool-call
-reasoning, Runtime returned a successful matching Observation, and streamed
-final text contained the file's private marker. It used 2 Provider attempts
-with 0 retries. The compiled TUI also completed a real `package.json` Read,
+The real-provider Read and Grep smokes passed with DeepSeek Thinking. Read
+reconstructed two bounded pages; Grep followed two live result pages, found the
+safe marker, and did not expose the `.env` marker. Both streamed reasoning,
+tool-call arguments, and final text through 3 Provider attempts with 0 retries.
+The compiled TUI also completed a real `package.json` Read,
 retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.
 

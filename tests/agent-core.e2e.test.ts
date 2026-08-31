@@ -13,6 +13,7 @@ import type {
   ToolExecutor,
 } from "../src/core/contracts.js";
 import { ProviderError } from "../src/core/provider-error.js";
+import { GrepTool } from "../src/runtime/grep-tool.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
 const temporaryRoots: string[] = [];
@@ -120,6 +121,32 @@ describe("read-only ReAct end-to-end", () => {
         )
         .join(""),
     ).toBe(content);
+  });
+
+  it("continues a bounded Grep before answering from a later match", async () => {
+    const { workspace } = await createWorkspace();
+    await writeFile(
+      join(workspace, "app.log"),
+      "ERROR unrelated\nERROR GREP_E2E_MARKER\n",
+      "utf8",
+    );
+    const runtime = new ToolRuntime([
+      await GrepTool.create({ workspaceRoot: workspace, maxMatches: 1 }),
+    ]);
+    const provider = new PagingGrepProvider("^ERROR", "app.log");
+    const core = new AgentCore(provider, runtime, { maxSteps: 4 });
+
+    const result = await core.run("Find the ERROR marker in app.log");
+
+    expect(result).toMatchObject({
+      kind: "final_answer",
+      answer: "The later match contains GREP_E2E_MARKER.",
+      steps: 3,
+    });
+    expect(provider.requests).toHaveLength(3);
+    expect(
+      result.messages.filter((message) => message.role === "tool"),
+    ).toHaveLength(2);
   });
 
   it("executes multiple tool calls sequentially in model order", async () => {
@@ -593,6 +620,70 @@ describe("read-only ReAct end-to-end", () => {
     expect(core.state).toEqual({ phase: "settled", outcome: "cancelled" });
   });
 
+  it("passes cancellation to an in-flight Runtime tool", async () => {
+    let markToolStarted: () => void = () => undefined;
+    const toolStarted = new Promise<void>((resolve) => {
+      markToolStarted = resolve;
+    });
+    const provider = new ScriptedProvider([
+      {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-cancellable-grep",
+            name: "grep",
+            rawArguments: JSON.stringify({ pattern: "ERROR" }),
+          },
+        ],
+      },
+    ]);
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async (call, options) => {
+        markToolStarted();
+        await new Promise<void>((resolve) => {
+          if (options?.signal?.aborted === true) {
+            resolve();
+            return;
+          }
+          options?.signal?.addEventListener("abort", () => resolve(), {
+            once: true,
+          });
+        });
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "error",
+          error: {
+            code: "cancelled",
+            message: "Grep was cancelled.",
+            retryable: false,
+          },
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime);
+
+    const running = core.run("Search for ERROR");
+    await toolStarted;
+    expect(core.cancel()).toBe(true);
+    const result = await running;
+
+    expect(result).toMatchObject({
+      kind: "stopped",
+      reason: "cancelled",
+      steps: 1,
+    });
+    expect(result.messages.at(-1)).toMatchObject({
+      role: "tool",
+      observation: {
+        status: "error",
+        error: { code: "cancelled" },
+      },
+    });
+  });
+
   it("retries only the second model request and preserves the Read Observation", async () => {
     const { workspace } = await createWorkspace();
     await writeFile(join(workspace, "README.md"), "PRESERVED_OBSERVATION\n", "utf8");
@@ -800,6 +891,80 @@ class PagingReadProvider implements ModelProvider {
   }
 }
 
+class PagingGrepProvider implements ModelProvider {
+  readonly requests: ModelRequest[] = [];
+
+  constructor(
+    private readonly pattern: string,
+    private readonly path: string,
+  ) {}
+
+  async complete(request: ModelRequest): Promise<ModelResponse> {
+    this.requests.push(request);
+    const observations = request.messages.filter(
+      (message) => message.role === "tool",
+    );
+    const lastObservation = observations.at(-1)?.observation;
+
+    if (lastObservation === undefined) {
+      return {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: "call-grep-1",
+            name: "grep",
+            rawArguments: JSON.stringify({
+              pattern: this.pattern,
+              path: this.path,
+            }),
+          },
+        ],
+      };
+    }
+    if (lastObservation.status !== "success") {
+      throw new Error("Expected a successful paged Grep Observation.");
+    }
+
+    const page = grepPageOutput(lastObservation.output);
+    if (!page.complete) {
+      if (page.nextCursor === undefined) {
+        throw new Error("An incomplete Grep page must include nextCursor.");
+      }
+      return {
+        kind: "tool_calls",
+        content: [],
+        calls: [
+          {
+            id: `call-grep-${observations.length + 1}`,
+            name: "grep",
+            rawArguments: JSON.stringify({
+              pattern: this.pattern,
+              path: this.path,
+              cursor: page.nextCursor,
+            }),
+          },
+        ],
+      };
+    }
+
+    const allMatches = observations.flatMap((message) =>
+      message.observation.status === "success"
+        ? grepPageOutput(message.observation.output).texts
+        : [],
+    );
+    if (!allMatches.some((text) => text.includes("GREP_E2E_MARKER"))) {
+      throw new Error("The completed Grep pages omitted GREP_E2E_MARKER.");
+    }
+    return {
+      kind: "final",
+      content: [
+        { type: "text", text: "The later match contains GREP_E2E_MARKER." },
+      ],
+    };
+  }
+}
+
 class RepeatingReadProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
 
@@ -842,6 +1007,37 @@ function readPageOutput(output: unknown): {
 
 function readPageContent(output: unknown): string {
   return readPageOutput(output).content;
+}
+
+function grepPageOutput(output: unknown): {
+  readonly texts: readonly string[];
+  readonly complete: boolean;
+  readonly nextCursor?: string;
+} {
+  if (typeof output !== "object" || output === null) {
+    throw new Error("Expected structured Grep page output.");
+  }
+  const page = output as Record<string, unknown>;
+  if (!Array.isArray(page["matches"]) || typeof page["complete"] !== "boolean") {
+    throw new Error("Expected matches and complete in Grep page output.");
+  }
+  const texts = page["matches"].map((match) => {
+    if (
+      typeof match !== "object" ||
+      match === null ||
+      typeof (match as Record<string, unknown>)["text"] !== "string"
+    ) {
+      throw new Error("Expected structured Grep match text.");
+    }
+    return (match as Record<string, unknown>)["text"] as string;
+  });
+  return {
+    texts,
+    complete: page["complete"],
+    ...(typeof page["nextCursor"] === "string"
+      ? { nextCursor: page["nextCursor"] }
+      : {}),
+  };
 }
 
 async function createWorkspace(): Promise<{ root: string; workspace: string }> {

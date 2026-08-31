@@ -23,7 +23,7 @@ afterEach(async () => {
 });
 
 describe("ToolRuntime", () => {
-  it("discloses the same strict Read argument contract to the model", async () => {
+  it("discloses the same strict read-only tool contracts to the model", async () => {
     const { workspace } = await createWorkspace();
     const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
 
@@ -50,6 +50,37 @@ describe("ToolRuntime", () => {
             },
           },
           required: ["path"],
+          additionalProperties: false,
+        },
+      },
+      {
+        name: "grep",
+        description:
+          "Search workspace files with a ripgrep regular expression. Use Grep to locate unknown content or file locations. Results are bounded and paged; when complete is false, repeat the same pattern and path with the returned nextCursor. Sensitive files are always skipped.",
+        inputSchema: {
+          type: "object",
+          properties: {
+            pattern: {
+              type: "string",
+              minLength: 1,
+              description:
+                "A ripgrep regular expression, for example ERROR.*order-\\d+.",
+            },
+            path: {
+              type: "string",
+              minLength: 1,
+              description:
+                "A file or directory relative to the workspace root. Omit to search the whole workspace.",
+            },
+            cursor: {
+              type: "string",
+              minLength: 1,
+              maxLength: 2048,
+              description:
+                "The exact nextCursor returned by the previous Grep page for the same pattern and path.",
+            },
+          },
+          required: ["pattern"],
           additionalProperties: false,
         },
       },
