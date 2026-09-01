@@ -14,6 +14,11 @@ import type {
 } from "../src/core/contracts.js";
 import { ProviderError } from "../src/core/provider-error.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
+import type {
+  RuntimeTool,
+  ToolApprovalPreparation,
+  ToolOutcome,
+} from "../src/runtime/tool.js";
 import { AgentApp } from "../src/tui/agent-app.js";
 
 const temporaryRoots: string[] = [];
@@ -179,6 +184,168 @@ it("routes Esc through the Core state machine and cancels the provider request",
   view.unmount();
 });
 
+it("shows the exact dangerous tool request and rejects it before execution", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-approval-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  const tool = new TuiApprovalProbeTool(workspace);
+  const runtime = new ToolRuntime([tool]);
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [],
+      calls: [
+        {
+          id: "call-tui-bash",
+          name: "bash",
+          rawArguments: JSON.stringify({ command: "npm test" }),
+        },
+      ],
+    },
+    {
+      kind: "final",
+      content: [{ type: "text", text: "The command was not executed." }],
+    },
+  ]);
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="运行测试"
+      onComplete={finish}
+    />,
+  );
+
+  await Promise.race([
+    waitForFrame(view, "approval required: bash"),
+    completion.then((earlyResult) => {
+      throw new Error(
+        `Run completed before approval: ${JSON.stringify(earlyResult)}`,
+      );
+    }),
+  ]);
+  expect(view.lastFrame()).toContain("command: npm test");
+  expect(view.lastFrame()).toContain(`cwd: ${workspace}`);
+
+  view.stdin.write("n");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result.kind).toBe("final_answer");
+  expect(tool.executionCount).toBe(0);
+  expect(
+    result.messages.some(
+      (message) =>
+        message.role === "tool" &&
+        message.observation.status === "error" &&
+        message.observation.error.code === "approval_rejected",
+    ),
+  ).toBe(true);
+  expect(
+    view.frames.some((frame) =>
+      frame.includes("observation error approval_rejected (call-tui-bash)"),
+    ),
+  ).toBe(true);
+  view.unmount();
+});
+
+it("cancels a pending approval without executing the dangerous tool", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-approval-cancel-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  const tool = new TuiApprovalProbeTool(workspace);
+  const runtime = new ToolRuntime([tool]);
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [],
+      calls: [
+        {
+          id: "call-cancel-bash",
+          name: "bash",
+          rawArguments: JSON.stringify({ command: "npm test" }),
+        },
+      ],
+    },
+  ]);
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="运行测试"
+      onComplete={finish}
+    />,
+  );
+
+  await waitForFrame(view, "approval required: bash");
+  view.stdin.write("\u001B");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result).toMatchObject({ kind: "stopped", reason: "cancelled" });
+  expect(tool.executionCount).toBe(0);
+  expect(result.messages.some((message) => message.role === "tool")).toBe(false);
+  expect(core.state).toEqual({ phase: "settled", outcome: "cancelled" });
+  view.unmount();
+});
+
+class TuiApprovalProbeTool implements RuntimeTool {
+  readonly definition = {
+    name: "bash",
+    description: "Approval TUI test tool.",
+    inputSchema: {
+      type: "object",
+      properties: { command: { type: "string" } },
+      required: ["command"],
+      additionalProperties: false,
+    },
+  };
+  readonly #workspace: string;
+  executionCount = 0;
+
+  constructor(workspace: string) {
+    this.#workspace = workspace;
+  }
+
+  prepareApproval(input: unknown): ToolApprovalPreparation {
+    const command = approvalCommand(input);
+    if (command === undefined) {
+      return {
+        status: "error",
+        error: {
+          code: "invalid_arguments",
+          message: "Bash expects one non-empty command.",
+          retryable: false,
+        },
+      };
+    }
+    return {
+      status: "approval_required",
+      command,
+      cwd: this.#workspace,
+    };
+  }
+
+  async execute(): Promise<ToolOutcome> {
+    this.executionCount += 1;
+    return { status: "success", output: { executed: true } };
+  }
+}
+
 class StreamingScriptedProvider implements ModelProvider {
   readonly requests: ModelRequest[] = [];
   readonly #responses: Array<ModelResponse | ProviderError>;
@@ -238,4 +405,32 @@ class StreamingScriptedProvider implements ModelProvider {
 
 async function renderTurn(delayMs = 10): Promise<void> {
   await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+}
+
+async function waitForFrame(
+  view: ReturnType<typeof render>,
+  expected: string,
+): Promise<void> {
+  for (let attempt = 0; attempt < 100; attempt += 1) {
+    if (view.lastFrame()?.includes(expected) === true) {
+      return;
+    }
+    await renderTurn();
+  }
+  throw new Error(
+    `TUI never rendered: ${expected}\nLast frame:\n${view.lastFrame() ?? "<none>"}`,
+  );
+}
+
+function approvalCommand(input: unknown): string | undefined {
+  if (
+    typeof input !== "object" ||
+    input === null ||
+    !("command" in input) ||
+    typeof input.command !== "string" ||
+    input.command.trim().length === 0
+  ) {
+    return undefined;
+  }
+  return input.command;
 }

@@ -16,6 +16,9 @@ export type {
   RunResult,
   RunStopReason,
   ToolCall,
+  ToolApprovalDecision,
+  ToolApprovalHandler,
+  ToolApprovalRequest,
   ToolDefinition,
   ToolExecutionOptions,
 } from "./core/contracts.js";

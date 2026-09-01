@@ -3,7 +3,12 @@ import { Box, Text, useApp, useInput } from "ink";
 import TextInput from "ink-text-input";
 
 import type { AgentCore } from "../core/agent-core.js";
-import type { RunEvent, RunResult } from "../core/contracts.js";
+import type {
+  RunEvent,
+  RunResult,
+  ToolApprovalDecision,
+  ToolApprovalRequest,
+} from "../core/contracts.js";
 
 const STREAMING_UI_FLUSH_MS = 50;
 const STREAMING_TEXT_PREVIEW_MAX_CHARS = 480;
@@ -56,7 +61,57 @@ export function AgentApp({
     undefined,
   );
   const [result, setResult] = useState<RunResult>();
+  const [pendingApproval, setPendingApproval] = useState<ToolApprovalRequest>();
+  const approvalSettlement = useRef<
+    ((decision: ToolApprovalDecision) => void) | undefined
+  >(undefined);
   const autoStarted = useRef(false);
+
+  const settleApproval = useCallback((decision: ToolApprovalDecision) => {
+    approvalSettlement.current?.(decision);
+  }, []);
+
+  const requestApproval = useCallback(
+    (request: ToolApprovalRequest, signal?: AbortSignal) =>
+      new Promise<ToolApprovalDecision>((resolve, reject) => {
+        if (signal?.aborted === true) {
+          reject(signal.reason);
+          return;
+        }
+        if (approvalSettlement.current !== undefined) {
+          reject(new Error("Another tool approval is already pending."));
+          return;
+        }
+
+        let settled = false;
+        const cleanup = () => {
+          signal?.removeEventListener("abort", onAbort);
+          approvalSettlement.current = undefined;
+          setPendingApproval(undefined);
+        };
+        const finish = (decision: ToolApprovalDecision) => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          resolve(decision);
+        };
+        const onAbort = () => {
+          if (settled) {
+            return;
+          }
+          settled = true;
+          cleanup();
+          reject(signal?.reason);
+        };
+
+        approvalSettlement.current = finish;
+        setPendingApproval(request);
+        signal?.addEventListener("abort", onAbort, { once: true });
+      }),
+    [],
+  );
 
   const clearStreamingOutput = useCallback(() => {
     pendingStreamingText.current = "";
@@ -99,6 +154,7 @@ export function AgentApp({
       clearStreamingOutput();
       setStreamingToolDrafts([]);
       const nextResult = await core.run(value, {
+        requestApproval,
         onEvent: (event) => {
           if (
             event.type === "model_request" ||
@@ -164,12 +220,24 @@ export function AgentApp({
       completeStreamingThinking,
       core,
       onComplete,
+      requestApproval,
       running,
     ],
   );
 
   useInput(
-    (_input, key) => {
+    (input, key) => {
+      if (pendingApproval !== undefined) {
+        const normalized = input.toLowerCase();
+        if (normalized === "y") {
+          settleApproval("approved");
+          return;
+        }
+        if (normalized === "n") {
+          settleApproval("rejected");
+          return;
+        }
+      }
       if (key.escape && core.cancel()) {
         setCancelling(true);
       }
@@ -218,8 +286,22 @@ export function AgentApp({
 
       {running ? (
         <Text color="yellow">
-          {cancelling ? "cancelling…" : "running… · Esc to cancel"}
+          {cancelling
+            ? "cancelling…"
+            : pendingApproval === undefined
+              ? "running… · Esc to cancel"
+              : "waiting for approval… · Esc to cancel"}
         </Text>
+      ) : null}
+      {pendingApproval !== undefined ? (
+        <Box flexDirection="column" borderStyle="round" borderColor="yellow">
+          <Text bold color="yellow">
+            approval required: {pendingApproval.toolName}
+          </Text>
+          <Text>command: {pendingApproval.command}</Text>
+          <Text>cwd: {pendingApproval.cwd}</Text>
+          <Text>[y] approve · [n] reject</Text>
+        </Box>
       ) : null}
       {completedThinking.map((thinking) => (
         <Text key={thinking.step} color="magenta">

@@ -9,6 +9,7 @@ import type {
   RunEvent,
   RunFailureReason,
   RunResult,
+  ToolApprovalHandler,
   ToolCall,
   ToolExecutor,
 } from "./contracts.js";
@@ -48,6 +49,7 @@ export interface AgentCoreOptions {
 export interface RunOptions {
   readonly signal?: AbortSignal;
   readonly onEvent?: (event: RunEvent) => void;
+  readonly requestApproval?: ToolApprovalHandler;
 }
 
 export class AgentCore {
@@ -128,6 +130,9 @@ export class AgentCore {
       const result = await this.#runLoop(prompt, {
         signal: controller.signal,
         ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
+        ...(options.requestApproval === undefined
+          ? {}
+          : { requestApproval: options.requestApproval }),
       });
       this.#transition({ type: "settle", outcome: runOutcome(result) });
       return result;
@@ -243,8 +248,14 @@ export class AgentCore {
         try {
           observation = await this.#runtime.execute(call, {
             ...(options.signal === undefined ? {} : { signal: options.signal }),
+            ...(options.requestApproval === undefined
+              ? {}
+              : { requestApproval: options.requestApproval }),
           });
         } catch {
+          if (isSignalAborted(options.signal)) {
+            return this.#stopped(step, messages, "cancelled", options.onEvent);
+          }
           return this.#failed(
             step,
             messages,

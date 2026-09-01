@@ -58,6 +58,55 @@ export class ToolRuntime implements ToolExecutor {
       );
     }
 
+    if (tool.prepareApproval !== undefined) {
+      let preparation;
+      try {
+        preparation = await tool.prepareApproval(input);
+      } catch {
+        return errorObservation(
+          call,
+          "tool_internal_error",
+          "The tool failed unexpectedly while preparing approval.",
+        );
+      }
+      if (preparation.status === "error") {
+        return {
+          toolCallId: call.id,
+          toolName: call.name,
+          status: "error",
+          error: preparation.error,
+        };
+      }
+
+      if (options.requestApproval === undefined) {
+        return errorObservation(
+          call,
+          "approval_required",
+          "This tool requires explicit user approval before execution.",
+        );
+      }
+
+      const decision = await options.requestApproval(
+        {
+          toolCallId: call.id,
+          toolName: call.name,
+          command: preparation.command,
+          cwd: preparation.cwd,
+        },
+        options.signal,
+      );
+      if (decision === "rejected") {
+        return errorObservation(
+          call,
+          "approval_rejected",
+          "The user rejected this tool execution.",
+        );
+      }
+      if (options.signal?.aborted === true) {
+        throw options.signal.reason;
+      }
+    }
+
     try {
       const outcome = await tool.execute(input, options);
       if (outcome.status === "success") {

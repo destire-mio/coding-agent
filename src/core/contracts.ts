@@ -26,6 +26,20 @@ export interface ToolError {
   readonly retryable: boolean;
 }
 
+export interface ToolApprovalRequest {
+  readonly toolCallId: string;
+  readonly toolName: string;
+  readonly command: string;
+  readonly cwd: string;
+}
+
+export type ToolApprovalDecision = "approved" | "rejected";
+
+export type ToolApprovalHandler = (
+  request: ToolApprovalRequest,
+  signal?: AbortSignal,
+) => Promise<ToolApprovalDecision>;
+
 export type Observation =
   | {
       readonly toolCallId: string;
@@ -132,6 +146,7 @@ export interface ToolExecutor {
 
 export interface ToolExecutionOptions {
   readonly signal?: AbortSignal;
+  readonly requestApproval?: ToolApprovalHandler;
 }
 
 export type RunEvent =
