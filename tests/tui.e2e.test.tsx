@@ -12,11 +12,14 @@ import type {
   ModelRequest,
   ModelResponse,
   RunResult,
+  ToolExecutor,
 } from "../src/core/contracts.js";
 import { ProviderError } from "../src/core/provider-error.js";
 import { BashTool, type BashResult } from "../src/runtime/bash-tool.js";
 import { ToolOutputStore } from "../src/runtime/tool-output-store.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
+import { foldSessionTranscript } from "../src/session/session-transcript-fold.js";
+import { SessionTranscriptStore } from "../src/session/session-transcript-store.js";
 import type {
   RuntimeTool,
   ToolApprovalPreparation,
@@ -119,6 +122,98 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
     view.frames.some((frame) =>
       frame.includes("thinking › The Read Observation contains the marker."),
     ),
+  ).toBe(true);
+  view.unmount();
+});
+
+it("auto-starts a selected unfinished Session through Core resume", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-resume-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const session = await SessionTranscriptStore.create({
+    workspaceRoot: workspace,
+    root: join(root, "sessions"),
+    sessionId: "tui-resume-session",
+  });
+  await session.append({
+    type: "turn_started",
+    turnId: "tui-resume-turn",
+    userInput: "Read README.md",
+  });
+  await session.append({
+    type: "tool_intent",
+    turnId: "tui-resume-turn",
+    step: 1,
+    operationId: "tui-resume-operation",
+    call: {
+      id: "tui-resume-call",
+      name: "read",
+      rawArguments: JSON.stringify({ path: "README.md" }),
+    },
+    replayContent: [{ type: "think", think: "I need README.md." }],
+  });
+  await session.append({
+    type: "tool_observation",
+    turnId: "tui-resume-turn",
+    step: 1,
+    operationId: "tui-resume-operation",
+    observation: {
+      toolCallId: "tui-resume-call",
+      toolName: "read",
+      status: "success",
+      output: { content: "TUI_RESUME_MARKER" },
+    },
+  });
+  const resumeState = foldSessionTranscript(await session.load());
+  if (resumeState.kind !== "awaiting_model") {
+    throw new Error("Expected an awaiting-model state.");
+  }
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "final",
+      content: [{ type: "text", text: "Recovered TUI_RESUME_MARKER." }],
+    },
+  ]);
+  let runtimeCalls = 0;
+  const runtime: ToolExecutor = {
+    definitions: () => [],
+    execute: async () => {
+      runtimeCalls += 1;
+      throw new Error("The TUI must not replay an observed tool.");
+    },
+  };
+  const core = new AgentCore(provider, runtime, { session, maxSteps: 4 });
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      sessionId={session.sessionId}
+      resumeState={resumeState}
+      onComplete={finish}
+    />,
+  );
+
+  const result = await completion;
+  await renderTurn();
+
+  expect(result).toMatchObject({
+    kind: "final_answer",
+    answer: "Recovered TUI_RESUME_MARKER.",
+  });
+  expect(runtimeCalls).toBe(0);
+  expect(provider.requests).toHaveLength(1);
+  expect(
+    view.frames.some((frame) =>
+      frame.includes("session: tui-resume-session · resuming"),
+    ),
+  ).toBe(true);
+  expect(
+    view.frames.some((frame) => frame.includes("Recovered TUI_RESUME_MARKER.")),
   ).toBe(true);
   view.unmount();
 });

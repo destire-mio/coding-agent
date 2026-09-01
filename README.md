@@ -107,9 +107,9 @@ requires the same diff to be approved again; any third content becomes a
 terminal `operation_conflict`. Replaying an applied operation returns its stored
 success, while a rejected operation leaves a minimal `cancelled` tombstone.
 Reusing one operation identity with different arguments is always rejected.
-This is the Edit side-effect recovery primitive, not full Session recovery: the
-CLI persists the current transcript but does not yet discover and automatically
-resume an old model conversation.
+On explicit Session continuation, Core redelivers an unfinished Edit with this
+same operation identity, so Runtime can reconcile the journal instead of blindly
+applying the change again. The CLI never guesses which Session to resume.
 Operation-record expiry and garbage collection are also not yet implemented.
 
 The CLI now starts one private Session transcript under
@@ -143,8 +143,9 @@ an observed tool. For `recovering_tool`, Read and Grep run again, Edit is
 redelivered with its original operation identity to the durable Edit journal,
 and Bash or any unclassified tool is never re-executed: Core records a
 `recovery_unknown_outcome` Observation instead. Recovery then continues the
-same loop and durably appends its terminal result. The CLI does not yet select
-an old Session, build later-Turn Context, compact history, list Sessions, or
+same loop and durably appends its terminal result. The CLI can explicitly open
+the exact Session named by `--continue`; it does not automatically select a
+recent Session, build later-Turn Context, compact history, list Sessions, or
 garbage-collect data.
 
 Core also owns the lifecycle of one active run:
@@ -212,6 +213,22 @@ node --env-file=.env dist/cli.js \
   --workspace /absolute/path/to/workspace \
   --prompt "读取 workspace 中的 README.md 并总结"
 ```
+
+To continue one known unfinished Session, use the same workspace and its exact
+Session ID:
+
+```bash
+node --env-file=.env dist/cli.js \
+  --workspace /absolute/path/to/workspace \
+  --continue <session-id>
+```
+
+`--prompt` creates a new Session and cannot be combined with `--continue`.
+Continuation opens only an existing Session; an unknown ID is not created. A
+Session with no unfinished Turn, or one whose latest Turn is already terminal,
+returns without contacting the Provider. Set `CODING_AGENT_SESSION_ROOT` when
+the private Session store should live somewhere other than
+`~/.coding-agent/sessions/`.
 
 `--max-steps` limits model rounds. Reaching the limit produces
 `stopped: max_steps`; it is never reported as success.
@@ -409,9 +426,10 @@ exponential backoff with jitter, `Retry-After`, and cancellation-aware waiting.
 There are deliberate simplifications and deviations. Kimi's Core defaults to
 10 attempts and its OpenAI client retains SDK retries; this milestone uses 3
 Core-visible attempts and disables SDK retries so its attempt count is directly
-explainable and testable. The current transcript records interrupted terminal
-states and durable Tool Intents, but it does not yet auto-resume them or write a
-synthetic unexecuted tool result; those belong to the later recovery milestone.
+explainable and testable. This project resumes only an explicitly selected
+unfinished Session. It re-executes recoverable read-only tools, reconciles Edit
+through its durable journal, and writes a synthetic
+`recovery_unknown_outcome` Observation instead of re-executing Bash.
 
 The Thinking round-trip was separately checked against Kimi Code at pinned
 commit
@@ -421,7 +439,8 @@ stream, and Adapter-owned conversion back to DeepSeek's reasoning field.
 Kimi persists a complete per-Agent Wire event stream for Session replay. This
 project now adopts the smaller append-only fact-log principle, but keeps only one
 Session transcript, one ToolCall per response, and no Session index, metadata
-snapshot, multi-Agent layout, automatic resume, or Context read model. Complete
+snapshot, multi-Agent layout, automatic latest-Session selection, or Context
+read model. Complete
 reasoning is durable only as private recovery payload for an unfinished Tool
 Intent and is excluded from completed final-answer records.
 
@@ -511,7 +530,7 @@ importing Kimi's complete Session/Wire stack.
 
 ## Status
 
-On 2026-09-01, the deterministic suite passed 126 tests across 17 test files. The
+On 2026-09-01, the deterministic suite passed 141 tests across 18 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -538,6 +557,12 @@ post-write verification, TUI diff display, the complete Core loop, stable
 operation identities, restart reconciliation, duplicate delivery, cancelled
 tombstones, and conflict fail-closed behavior.
 
+A compiled-CLI recovery smoke opens an explicitly selected unfinished Session
+in a fresh Node process, rebuilds the durable Read Observation, sends exactly one
+Provider request, and persists the returned final answer. Store and TUI tests
+also prove that opening an unknown Session does not create it and that an
+observed tool is not executed again during resume.
+
 The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
 safe marker, and did not expose the `.env` marker. Both streamed reasoning,
@@ -558,8 +583,9 @@ retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.
 
 This proves the current minimum chain, deterministic Edit side-effect recovery,
-and durable Session write-ahead ordering. It does not yet prove automatic
-Session/Turn resumption, later-Turn Context projection, power-loss durability, a
+durable Session write-ahead ordering, and explicit same-Turn continuation from a
+fresh CLI process. It does not yet prove automatic latest-Session selection,
+later-Turn Context projection, power-loss durability at every write boundary, a
 hostile-workspace sandbox, or the later complete production milestone.
 
 ## License

@@ -69,12 +69,14 @@ export {
   SessionTranscriptConfigurationError,
   SessionTranscriptCorruptError,
   SessionTranscriptError,
+  SessionTranscriptNotFoundError,
   SessionTranscriptStore,
 } from "./session/session-transcript-store.js";
 export type {
   SessionEvent,
   SessionEventInput,
   SessionEventWriter,
+  SessionTranscriptOpenOptions,
   SessionTranscriptStoreOptions,
 } from "./session/session-transcript-store.js";
 export { foldSessionTranscript } from "./session/session-transcript-fold.js";

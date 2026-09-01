@@ -8,7 +8,7 @@ import {
   writeFile,
 } from "node:fs/promises";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
 import { AgentCore } from "../src/core/agent-core.js";
@@ -22,6 +22,7 @@ import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import {
   SessionTranscriptConfigurationError,
   SessionTranscriptCorruptError,
+  SessionTranscriptNotFoundError,
   SessionTranscriptStore,
   type SessionEventInput,
   type SessionEventWriter,
@@ -129,6 +130,43 @@ describe("Session transcript JSONL", () => {
       }),
     ).rejects.toBeInstanceOf(SessionTranscriptConfigurationError);
     await expect(stat(forbiddenRoot)).rejects.toMatchObject({ code: "ENOENT" });
+  });
+
+  it("opens an existing Session without appending another start event", async () => {
+    const harness = await createStore("session-open");
+    await harness.store.append({
+      type: "turn_started",
+      turnId: "turn-open",
+      userInput: "Read README.md",
+    });
+
+    const opened = await SessionTranscriptStore.open({
+      workspaceRoot: harness.workspace,
+      root: harness.storeRoot,
+      sessionId: "session-open",
+    });
+
+    expect(opened.transcriptPath).toBe(harness.store.transcriptPath);
+    expect((await opened.load()).map((event) => event.type)).toEqual([
+      "session_started",
+      "turn_started",
+    ]);
+  });
+
+  it("does not create a Session when open receives an unknown identity", async () => {
+    const harness = await createStore("session-existing");
+    const workspaceBucket = dirname(dirname(harness.store.transcriptPath));
+
+    await expect(
+      SessionTranscriptStore.open({
+        workspaceRoot: harness.workspace,
+        root: harness.storeRoot,
+        sessionId: "session-missing",
+      }),
+    ).rejects.toBeInstanceOf(SessionTranscriptNotFoundError);
+    await expect(stat(join(workspaceBucket, "session-missing"))).rejects.toMatchObject(
+      { code: "ENOENT" },
+    );
   });
 });
 

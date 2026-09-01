@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from "react";
-import { Box, Text, useApp, useInput } from "ink";
+import { Box, Text, useApp, useInput, useStdin } from "ink";
 import TextInput from "ink-text-input";
 
 import type { AgentCore } from "../core/agent-core.js";
@@ -9,6 +9,7 @@ import type {
   ToolApprovalDecision,
   ToolApprovalRequest,
 } from "../core/contracts.js";
+import type { ResumableSessionState } from "../session/session-transcript-fold.js";
 
 const STREAMING_UI_FLUSH_MS = 50;
 const STREAMING_TEXT_PREVIEW_MAX_CHARS = 480;
@@ -17,9 +18,15 @@ const STREAMING_TOOL_PREVIEW_MAX_CHARS = 1_024;
 export interface AgentAppProps {
   readonly core: AgentCore;
   readonly workspace: string;
+  readonly sessionId?: string;
   readonly initialPrompt?: string;
+  readonly resumeState?: ResumableSessionState;
   readonly onComplete?: (result: RunResult) => void;
 }
+
+type AgentStartRequest =
+  | { readonly kind: "new"; readonly input: string }
+  | { readonly kind: "resume"; readonly state: ResumableSessionState };
 
 interface StreamingToolDraft {
   readonly index: number;
@@ -36,10 +43,14 @@ interface CompletedThinking {
 export function AgentApp({
   core,
   workspace,
+  sessionId,
   initialPrompt,
+  resumeState,
   onComplete,
 }: AgentAppProps) {
   const { exit } = useApp();
+  const { isRawModeSupported } = useStdin();
+  const canUseInput = isRawModeSupported === true;
   const [prompt, setPrompt] = useState(initialPrompt ?? "");
   const [running, setRunning] = useState(false);
   const [cancelling, setCancelling] = useState(false);
@@ -141,9 +152,12 @@ export function AgentApp({
     }
   }, []);
 
-  const submit = useCallback(
-    async (value: string) => {
-      if (running || value.trim().length === 0) {
+  const start = useCallback(
+    async (request: AgentStartRequest) => {
+      if (
+        running ||
+        (request.kind === "new" && request.input.trim().length === 0)
+      ) {
         return;
       }
 
@@ -153,9 +167,9 @@ export function AgentApp({
       setCompletedThinking([]);
       clearStreamingOutput();
       setStreamingToolDrafts([]);
-      const nextResult = await core.run(value, {
-        requestApproval,
-        onEvent: (event) => {
+      const runOptions = {
+        ...(canUseInput ? { requestApproval } : {}),
+        onEvent: (event: RunEvent) => {
           if (
             event.type === "model_request" ||
             event.type === "provider_retry"
@@ -209,7 +223,11 @@ export function AgentApp({
             setEvents((current) => [...current, description]);
           }
         },
-      });
+      } as const;
+      const nextResult =
+        request.kind === "resume"
+          ? await core.resume(request.state, runOptions)
+          : await core.run(request.input, runOptions);
       setResult(nextResult);
       setRunning(false);
       setCancelling(false);
@@ -217,6 +235,7 @@ export function AgentApp({
     },
     [
       clearStreamingOutput,
+      canUseInput,
       completeStreamingThinking,
       core,
       onComplete,
@@ -242,15 +261,23 @@ export function AgentApp({
         setCancelling(true);
       }
     },
-    { isActive: running },
+    { isActive: running && canUseInput },
   );
 
   useEffect(() => {
-    if (initialPrompt !== undefined && !autoStarted.current) {
-      autoStarted.current = true;
-      void submit(initialPrompt);
+    if (autoStarted.current) {
+      return;
     }
-  }, [initialPrompt, submit]);
+    if (resumeState !== undefined) {
+      autoStarted.current = true;
+      void start({ kind: "resume", state: resumeState });
+      return;
+    }
+    if (initialPrompt !== undefined) {
+      autoStarted.current = true;
+      void start({ kind: "new", input: initialPrompt });
+    }
+  }, [initialPrompt, resumeState, start]);
 
   useEffect(() => {
     if (result !== undefined) {
@@ -276,11 +303,26 @@ export function AgentApp({
         coding-agent · local workspace
       </Text>
       <Text dimColor>workspace: {workspace}</Text>
+      {sessionId !== undefined ? (
+        <Text dimColor>
+          session: {sessionId}
+          {resumeState === undefined ? "" : " · resuming"}
+        </Text>
+      ) : null}
 
-      {!running && result === undefined && initialPrompt === undefined ? (
+      {!running &&
+      result === undefined &&
+      initialPrompt === undefined &&
+      resumeState === undefined ? (
         <Box marginTop={1}>
           <Text color="green">task › </Text>
-          <TextInput value={prompt} onChange={setPrompt} onSubmit={submit} />
+          <TextInput
+            value={prompt}
+            onChange={setPrompt}
+            onSubmit={(input) => {
+              void start({ kind: "new", input });
+            }}
+          />
         </Box>
       ) : null}
 

@@ -130,9 +130,16 @@ export interface SessionTranscriptStoreOptions {
   readonly sessionId?: string;
 }
 
+export interface SessionTranscriptOpenOptions {
+  readonly workspaceRoot: string;
+  readonly root?: string;
+  readonly sessionId: string;
+}
+
 export class SessionTranscriptConfigurationError extends Error {}
 export class SessionTranscriptError extends Error {}
 export class SessionTranscriptCorruptError extends SessionTranscriptError {}
+export class SessionTranscriptNotFoundError extends SessionTranscriptError {}
 
 /** Append-only private facts for one Agent session. */
 export class SessionTranscriptStore implements SessionEventWriter {
@@ -235,6 +242,108 @@ export class SessionTranscriptStore implements SessionEventWriter {
       }
       throw new SessionTranscriptConfigurationError(
         "The private Session store could not be initialized.",
+      );
+    }
+  }
+
+  static async open(
+    options: SessionTranscriptOpenOptions,
+  ): Promise<SessionTranscriptStore> {
+    validateSessionId(options.sessionId);
+
+    try {
+      const requestedWorkspaceRoot = resolve(options.workspaceRoot);
+      const workspaceRoot = await realpath(options.workspaceRoot);
+      const workspaceStat = await stat(workspaceRoot);
+      if (!workspaceStat.isDirectory()) {
+        throw new SessionTranscriptConfigurationError(
+          "The Session workspace root must be a directory.",
+        );
+      }
+
+      const requestedRoot =
+        options.root ?? join(homedir(), ".coding-agent", "sessions");
+      const resolvedRequestedRoot = resolve(requestedRoot);
+      if (
+        isPathInside(requestedWorkspaceRoot, resolvedRequestedRoot) ||
+        isPathInside(workspaceRoot, resolvedRequestedRoot)
+      ) {
+        throw new SessionTranscriptConfigurationError(
+          "The private Session store must be outside the workspace.",
+        );
+      }
+
+      let root: string;
+      try {
+        root = await realpath(requestedRoot);
+      } catch (error) {
+        if (isMissingPathError(error)) {
+          throw new SessionTranscriptNotFoundError(
+            "The requested Session does not exist.",
+          );
+        }
+        throw error;
+      }
+      if (isPathInside(workspaceRoot, root)) {
+        throw new SessionTranscriptConfigurationError(
+          "The private Session store must be outside the workspace.",
+        );
+      }
+
+      const workspaceBucket = `workspace-${createHash("sha256")
+        .update(workspaceRoot)
+        .digest("hex")
+        .slice(0, 16)}`;
+      const transcriptPath = join(
+        root,
+        workspaceBucket,
+        options.sessionId,
+        "transcript.jsonl",
+      );
+      try {
+        const transcriptStat = await stat(transcriptPath);
+        if (!transcriptStat.isFile()) {
+          throw new SessionTranscriptNotFoundError(
+            "The requested Session does not exist.",
+          );
+        }
+      } catch (error) {
+        if (error instanceof SessionTranscriptNotFoundError) {
+          throw error;
+        }
+        if (isMissingPathError(error)) {
+          throw new SessionTranscriptNotFoundError(
+            "The requested Session does not exist.",
+          );
+        }
+        throw error;
+      }
+
+      const store = new SessionTranscriptStore(
+        options.sessionId,
+        workspaceRoot,
+        transcriptPath,
+      );
+      const events = await store.load();
+      const first = events[0];
+      if (
+        first?.type !== "session_started" ||
+        first.workspaceRoot !== workspaceRoot
+      ) {
+        throw new SessionTranscriptCorruptError(
+          "The Session transcript identity is invalid.",
+        );
+      }
+      return store;
+    } catch (error) {
+      if (
+        error instanceof SessionTranscriptConfigurationError ||
+        error instanceof SessionTranscriptError
+      ) {
+        throw error;
+      }
+      throw new SessionTranscriptConfigurationError(
+        "The private Session store could not be opened.",
       );
     }
   }
@@ -346,4 +455,13 @@ function validateSessionId(sessionId: string): void {
 function isPathInside(root: string, candidate: string): boolean {
   const path = relative(root, resolve(candidate));
   return path === "" || (!path.startsWith("..") && !isAbsolute(path));
+}
+
+function isMissingPathError(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    error.code === "ENOENT"
+  );
 }
