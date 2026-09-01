@@ -21,10 +21,16 @@ import type {
   ToolApprovalRequest,
   ToolCall,
 } from "../src/core/contracts.js";
+import {
+  EditOperationStore,
+  EditOperationStoreConfigurationError,
+  type PendingEditOperationRecord,
+} from "../src/runtime/edit-operation-store.js";
 import type { EditResult } from "../src/runtime/edit-tool.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
 const temporaryRoots: string[] = [];
+const DEFAULT_EDIT_OPERATION_ID = "operation-edit-default";
 
 afterEach(async () => {
   await Promise.all(
@@ -35,6 +41,21 @@ afterEach(async () => {
 });
 
 describe("EditTool", () => {
+  it("refuses to place private Edit operation state inside the workspace", async () => {
+    const root = await mkdtemp(join(tmpdir(), "coding-agent-edit-boundary-"));
+    temporaryRoots.push(root);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+
+    await expect(
+      ToolRuntime.withEdit({
+        workspaceRoot: workspace,
+        toolOutputRoot: join(root, "tool-output"),
+        editOperationRoot: join(workspace, ".private-edit-state"),
+      }),
+    ).rejects.toThrow(EditOperationStoreConfigurationError);
+  });
+
   it("publishes one exact replacement contract without replace_all", async () => {
     const harness = await createHarness();
     const definition = harness.runtime
@@ -70,6 +91,7 @@ describe("EditTool", () => {
         expectedVersion: version,
       }),
       {
+        operationId: DEFAULT_EDIT_OPERATION_ID,
         requestApproval: async (request) => {
           approvals.push(request);
           return "approved";
@@ -129,6 +151,7 @@ describe("EditTool", () => {
         newString: "timeout=180",
         expectedVersion: version,
       }),
+      { operationId: DEFAULT_EDIT_OPERATION_ID },
     );
 
     expectError(observation, "approval_required");
@@ -148,11 +171,306 @@ describe("EditTool", () => {
         newString: "timeout=180",
         expectedVersion: version,
       }),
-      { requestApproval: async () => "rejected" },
+      {
+        operationId: DEFAULT_EDIT_OPERATION_ID,
+        requestApproval: async () => "rejected",
+      },
     );
 
     expectError(observation, "approval_rejected");
     await expect(readFile(path, "utf8")).resolves.toBe("timeout=120\n");
+  });
+
+  it("requires Core to provide a stable operation identity", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    let approvalCount = 0;
+
+    const observation = await harness.runtime.execute(
+      editCall({
+        path: "config.ts",
+        oldString: "timeout=120",
+        newString: "timeout=180",
+        expectedVersion: version,
+      }),
+      {
+        requestApproval: async () => {
+          approvalCount += 1;
+          return "approved";
+        },
+      },
+    );
+
+    expectError(observation, "missing_operation_id");
+    expect(approvalCount).toBe(0);
+    await expect(readFile(path, "utf8")).resolves.toBe("timeout=120\n");
+  });
+
+  it("does not write when the private operation store disappears after approval", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+
+    const observation = await harness.runtime.execute(
+      editCall({
+        path: "config.ts",
+        oldString: "timeout=120",
+        newString: "timeout=180",
+        expectedVersion: version,
+      }),
+      {
+        operationId: "operation-checkpoint-failure",
+        requestApproval: async () => {
+          await rm(harness.editOperationRoot, {
+            recursive: true,
+            force: true,
+          });
+          await writeFile(harness.editOperationRoot, "blocked", "utf8");
+          return "approved";
+        },
+      },
+    );
+
+    expectError(observation, "operation_store_failed");
+    await expect(readFile(path, "utf8")).resolves.toBe("timeout=120\n");
+  });
+
+  it("returns the stored success for a duplicate applied operation without writing again", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const call = editCall({
+      path: "config.ts",
+      oldString: "timeout=120",
+      newString: "timeout=180",
+      expectedVersion: version,
+    });
+    const operationId = "operation-applied-replay";
+
+    const first = await harness.runtime.execute(call, {
+      operationId,
+      requestApproval: async () => "approved",
+    });
+    const firstResult = successResult(first);
+    const inodeAfterFirst = (await stat(path, { bigint: true })).ino;
+    const restarted = await restartRuntime(harness);
+    let replayApprovalCount = 0;
+
+    const replay = await restarted.execute(call, {
+      operationId,
+      requestApproval: async () => {
+        replayApprovalCount += 1;
+        return "approved";
+      },
+    });
+
+    expect(successResult(replay)).toEqual(firstResult);
+    expect(replayApprovalCount).toBe(0);
+    expect((await stat(path, { bigint: true })).ino).toBe(inodeAfterFirst);
+  });
+
+  it("recovers pending as applied when the file already has the intended content", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const call = editCall({
+      path: "config.ts",
+      oldString: "timeout=120",
+      newString: "timeout=180",
+      expectedVersion: version,
+    });
+    const operationId = "operation-crash-after-rename";
+    successResult(
+      await harness.runtime.execute(call, {
+        operationId,
+        requestApproval: async () => "approved",
+      }),
+    );
+    await forcePending(harness, operationId);
+    const inodeBeforeRecovery = (await stat(path, { bigint: true })).ino;
+    const restarted = await restartRuntime(harness);
+    let approvalCount = 0;
+
+    const recovered = await restarted.execute(call, {
+      operationId,
+      requestApproval: async () => {
+        approvalCount += 1;
+        return "approved";
+      },
+    });
+
+    expect(successResult(recovered)).toMatchObject({ path: "config.ts" });
+    expect(approvalCount).toBe(0);
+    expect((await stat(path, { bigint: true })).ino).toBe(inodeBeforeRecovery);
+    await expect(operationState(harness, operationId)).resolves.toBe("applied");
+  });
+
+  it("re-asks approval and applies when pending still has the before content", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const call = editCall({
+      path: "config.ts",
+      oldString: "timeout=120",
+      newString: "timeout=180",
+      expectedVersion: version,
+    });
+    const operationId = "operation-crash-before-rename";
+    successResult(
+      await harness.runtime.execute(call, {
+        operationId,
+        requestApproval: async () => "approved",
+      }),
+    );
+    await forcePending(harness, operationId);
+    await writeFile(path, "timeout=120\n", "utf8");
+    const restarted = await restartRuntime(harness);
+    const approvals: ToolApprovalRequest[] = [];
+
+    const recovered = await restarted.execute(call, {
+      operationId,
+      requestApproval: async (request) => {
+        approvals.push(request);
+        return "approved";
+      },
+    });
+
+    expect(successResult(recovered)).toMatchObject({ path: "config.ts" });
+    expect(approvals).toHaveLength(1);
+    expect(approvals[0]).toMatchObject({
+      kind: "file_edit",
+      path: "config.ts",
+      diff: expect.stringContaining("+timeout=180"),
+    });
+    await expect(readFile(path, "utf8")).resolves.toBe("timeout=180\n");
+    await expect(operationState(harness, operationId)).resolves.toBe("applied");
+  });
+
+  it("returns operation_conflict when pending content is neither before nor after", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const call = editCall({
+      path: "config.ts",
+      oldString: "timeout=120",
+      newString: "timeout=180",
+      expectedVersion: version,
+    });
+    const operationId = "operation-recovery-conflict";
+    successResult(
+      await harness.runtime.execute(call, {
+        operationId,
+        requestApproval: async () => "approved",
+      }),
+    );
+    await forcePending(harness, operationId);
+    await writeFile(path, "timeout=external-change\n", "utf8");
+    const restarted = await restartRuntime(harness);
+    let approvalCount = 0;
+
+    const recovered = await restarted.execute(call, {
+      operationId,
+      requestApproval: async () => {
+        approvalCount += 1;
+        return "approved";
+      },
+    });
+
+    expectError(recovered, "operation_conflict");
+    expect(approvalCount).toBe(0);
+    await expect(readFile(path, "utf8")).resolves.toBe(
+      "timeout=external-change\n",
+    );
+    await expect(operationState(harness, operationId)).resolves.toBe("conflict");
+  });
+
+  it("keeps a minimal cancelled tombstone and refuses the same operation after restart", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const call = editCall({
+      path: "config.ts",
+      oldString: "timeout=120",
+      newString: "timeout=180",
+      expectedVersion: version,
+    });
+    const operationId = "operation-cancelled-replay";
+
+    const rejected = await harness.runtime.execute(call, {
+      operationId,
+      requestApproval: async () => "rejected",
+    });
+    expectError(rejected, "approval_rejected");
+    const store = await EditOperationStore.create({
+      root: harness.editOperationRoot,
+    });
+    const cancelled = await store.read(operationId);
+    expect(cancelled).toMatchObject({ state: "cancelled", operationId });
+    expect(JSON.stringify(cancelled)).not.toContain("timeout=120");
+    expect(JSON.stringify(cancelled)).not.toContain("timeout=180");
+
+    const restarted = await restartRuntime(harness);
+    let approvalCount = 0;
+    const replay = await restarted.execute(call, {
+      operationId,
+      requestApproval: async () => {
+        approvalCount += 1;
+        return "approved";
+      },
+    });
+
+    expectError(replay, "operation_cancelled");
+    expect(approvalCount).toBe(0);
+    await expect(readFile(path, "utf8")).resolves.toBe("timeout=120\n");
+  });
+
+  it("rejects different arguments that reuse an applied operation identity", async () => {
+    const harness = await createHarness();
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "timeout=120\n", "utf8");
+    const version = await readVersion(harness.runtime, "config.ts");
+    const operationId = "operation-argument-conflict";
+    successResult(
+      await harness.runtime.execute(
+        editCall({
+          path: "config.ts",
+          oldString: "timeout=120",
+          newString: "timeout=180",
+          expectedVersion: version,
+        }),
+        { operationId, requestApproval: async () => "approved" },
+      ),
+    );
+    const restarted = await restartRuntime(harness);
+    let approvalCount = 0;
+
+    const replay = await restarted.execute(
+      editCall({
+        path: "config.ts",
+        oldString: "timeout=120",
+        newString: "timeout=240",
+        expectedVersion: version,
+      }),
+      {
+        operationId,
+        requestApproval: async () => {
+          approvalCount += 1;
+          return "approved";
+        },
+      },
+    );
+
+    expectError(replay, "operation_conflict");
+    expect(approvalCount).toBe(0);
+    await expect(readFile(path, "utf8")).resolves.toBe("timeout=180\n");
   });
 
   it("invalidates approval when the file changes while the user is deciding", async () => {
@@ -170,6 +488,7 @@ describe("EditTool", () => {
         expectedVersion: version,
       }),
       {
+        operationId: DEFAULT_EDIT_OPERATION_ID,
         requestApproval: async () => {
           approvalCount += 1;
           await writeFile(path, "timeout=120\nmode=debug\n", "utf8");
@@ -204,6 +523,7 @@ describe("EditTool", () => {
         expectedVersion: version,
       }),
       {
+        operationId: DEFAULT_EDIT_OPERATION_ID,
         requestApproval: async () => {
           approvalCount += 1;
           return "approved";
@@ -256,7 +576,7 @@ describe("EditTool", () => {
           newString: "replacement",
           expectedVersion: version,
         }),
-        { requestApproval: approval },
+        { operationId: DEFAULT_EDIT_OPERATION_ID, requestApproval: approval },
       ),
       "old_string_not_found",
     );
@@ -268,7 +588,7 @@ describe("EditTool", () => {
           newString: "timeout=120",
           expectedVersion: version,
         }),
-        { requestApproval: approval },
+        { operationId: DEFAULT_EDIT_OPERATION_ID, requestApproval: approval },
       ),
       "invalid_arguments",
     );
@@ -280,7 +600,7 @@ describe("EditTool", () => {
           newString: "changed",
           expectedVersion: version,
         }),
-        { requestApproval: approval },
+        { operationId: DEFAULT_EDIT_OPERATION_ID, requestApproval: approval },
       ),
       "path_outside_workspace",
     );
@@ -301,7 +621,10 @@ describe("EditTool", () => {
         newString: "changed",
         expectedVersion: "file-version-v1:invalid",
       }),
-      { requestApproval: async () => "approved" },
+      {
+        operationId: DEFAULT_EDIT_OPERATION_ID,
+        requestApproval: async () => "approved",
+      },
     );
 
     expectError(observation, "path_outside_workspace");
@@ -334,6 +657,18 @@ describe("EditTool", () => {
         .filter((message) => message.role === "tool")
         .map((message) => message.toolName),
     ).toEqual(["read", "edit"]);
+    const editMessage = result.messages.find(
+      (message) => message.role === "tool" && message.toolName === "edit",
+    );
+    if (editMessage?.role !== "tool") {
+      throw new Error("Expected the Core Edit tool message.");
+    }
+    expect(editMessage.operationId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/,
+    );
+    await expect(
+      operationState(harness, editMessage.operationId),
+    ).resolves.toBe("applied");
     expect(approvals).toHaveLength(1);
     expect(approvals[0]).toMatchObject({
       kind: "file_edit",
@@ -388,20 +723,72 @@ class EditFlowProvider implements ModelProvider {
 async function createHarness(): Promise<{
   readonly root: string;
   readonly workspace: string;
+  readonly toolOutputRoot: string;
+  readonly editOperationRoot: string;
   readonly runtime: ToolRuntime;
 }> {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-edit-"));
   temporaryRoots.push(root);
   const workspace = join(root, "workspace");
   await mkdir(workspace);
+  const toolOutputRoot = join(root, "tool-output");
+  const editOperationRoot = join(root, "edit-operations");
   return {
     root,
     workspace,
+    toolOutputRoot,
+    editOperationRoot,
     runtime: await ToolRuntime.withEdit({
       workspaceRoot: workspace,
-      toolOutputRoot: join(root, "tool-output"),
+      toolOutputRoot,
+      editOperationRoot,
     }),
   };
+}
+
+async function restartRuntime(harness: {
+  readonly workspace: string;
+  readonly toolOutputRoot: string;
+  readonly editOperationRoot: string;
+}): Promise<ToolRuntime> {
+  return ToolRuntime.withEdit({
+    workspaceRoot: harness.workspace,
+    toolOutputRoot: harness.toolOutputRoot,
+    editOperationRoot: harness.editOperationRoot,
+  });
+}
+
+async function forcePending(
+  harness: { readonly editOperationRoot: string },
+  operationId: string,
+): Promise<void> {
+  const store = await EditOperationStore.create({
+    root: harness.editOperationRoot,
+  });
+  const record = await store.read(operationId);
+  if (record?.state !== "applied") {
+    throw new Error("Expected an applied Edit operation record.");
+  }
+  const {
+    afterVersion: _afterVersion,
+    state: _state,
+    ...pendingFields
+  } = record;
+  const pending: PendingEditOperationRecord = {
+    ...pendingFields,
+    state: "pending",
+  };
+  await store.write(pending);
+}
+
+async function operationState(
+  harness: { readonly editOperationRoot: string },
+  operationId: string,
+): Promise<string | undefined> {
+  const store = await EditOperationStore.create({
+    root: harness.editOperationRoot,
+  });
+  return (await store.read(operationId))?.state;
 }
 
 function readCall(path: string, id = "call-read"): ToolCall {

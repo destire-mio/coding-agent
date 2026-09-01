@@ -14,13 +14,19 @@ export type ToolApprovalPreparation =
       readonly status: "approval_required";
       readonly approval: ToolApprovalDetails;
     }
+  | { readonly status: "resolved"; readonly outcome: ToolOutcome }
   | { readonly status: "error"; readonly error: ToolError };
 
 export interface RuntimeTool {
   readonly definition: ToolDefinition;
   prepareApproval?(
     input: unknown,
+    options?: ToolExecutionOptions,
   ): ToolApprovalPreparation | Promise<ToolApprovalPreparation>;
+  recordApprovalRejection?(
+    input: unknown,
+    options?: ToolExecutionOptions,
+  ): Promise<ToolError | undefined>;
   execute(input: unknown, options?: ToolExecutionOptions): Promise<ToolOutcome>;
 }
 

@@ -1,4 +1,4 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { constants } from "node:fs";
 import { open, realpath, rename, rm, stat } from "node:fs/promises";
 import {
@@ -18,6 +18,13 @@ import type {
   ToolError,
   ToolExecutionOptions,
 } from "../core/contracts.js";
+import {
+  type AppliedEditOperationRecord,
+  type EditOperationIntent,
+  type EditOperationRecord,
+  type EditOperationStore,
+  type PendingEditOperationRecord,
+} from "./edit-operation-store.js";
 import {
   issueFileVersionToken,
   matchesFileVersionToken,
@@ -59,6 +66,7 @@ const editArgumentsSchema = z
 export interface EditToolOptions {
   readonly workspaceRoot: string;
   readonly fileVersionSecret: Uint8Array;
+  readonly operationStore: EditOperationStore;
 }
 
 export interface EditResult {
@@ -75,13 +83,58 @@ interface PreparedEdit {
   readonly displayPath: string;
   readonly beforeVersion: string;
   readonly candidate: string;
+  readonly beforeContentHash: string;
+  readonly afterContentHash: string;
   readonly diff: string;
   readonly mode: number;
+}
+
+type EditInput = z.infer<typeof editArgumentsSchema>;
+
+interface EditOperationContext {
+  readonly operationId: string;
+  readonly workspaceRoot: string;
+  readonly input: EditInput;
+  readonly intent: EditOperationIntent;
+  readonly requestFingerprint: string;
 }
 
 type PreparedEditOutcome =
   | { readonly status: "ready"; readonly edit: PreparedEdit }
   | { readonly status: "error"; readonly error: ToolError };
+
+type PendingResolution =
+  | {
+      readonly status: "before";
+      readonly edit: PreparedEdit;
+      readonly pending: PendingEditOperationRecord;
+    }
+  | {
+      readonly status: "after";
+      readonly applied: AppliedEditOperationRecord;
+    }
+  | { readonly status: "error"; readonly error: ToolError };
+
+type ExistingExecutionResolution =
+  | {
+      readonly status: "ready";
+      readonly edit: PreparedEdit;
+      readonly pending: PendingEditOperationRecord;
+    }
+  | ToolOutcome;
+
+interface WorkspaceFileLocation {
+  readonly status: "ready";
+  readonly canonicalPath: string;
+  readonly displayPath: string;
+}
+
+interface FileSnapshot {
+  readonly status: "ready";
+  readonly content: string;
+  readonly version: ReturnType<typeof toFileVersion>;
+  readonly mode: number;
+}
 
 export class EditTool implements RuntimeTool {
   readonly definition: ToolDefinition = {
@@ -96,13 +149,16 @@ export class EditTool implements RuntimeTool {
 
   readonly #workspaceRoot: string;
   readonly #fileVersionSecret: Buffer;
+  readonly #operationStore: EditOperationStore;
 
   private constructor(
     workspaceRoot: string,
     fileVersionSecret: Uint8Array,
+    operationStore: EditOperationStore,
   ) {
     this.#workspaceRoot = workspaceRoot;
     this.#fileVersionSecret = Buffer.from(fileVersionSecret);
+    this.#operationStore = operationStore;
   }
 
   static async create(options: EditToolOptions): Promise<EditTool> {
@@ -119,23 +175,77 @@ export class EditTool implements RuntimeTool {
     if (options.fileVersionSecret.byteLength < 32) {
       throw new Error("The file version secret must contain at least 32 bytes.");
     }
-    return new EditTool(workspaceRoot, options.fileVersionSecret);
+    return new EditTool(
+      workspaceRoot,
+      options.fileVersionSecret,
+      options.operationStore,
+    );
   }
 
-  async prepareApproval(input: unknown): Promise<ToolApprovalPreparation> {
-    const prepared = await this.#prepare(input);
-    if (prepared.status === "error") {
-      return prepared;
+  async prepareApproval(
+    input: unknown,
+    options: ToolExecutionOptions = {},
+  ): Promise<ToolApprovalPreparation> {
+    const parsed = this.#operationContext(input, options.operationId);
+    if (parsed.status === "error") {
+      return parsed;
     }
-    return {
-      status: "approval_required",
-      approval: {
-        kind: "file_edit",
-        path: prepared.edit.displayPath,
-        beforeVersion: prepared.edit.beforeVersion,
-        diff: prepared.edit.diff,
-      },
-    };
+    const loaded = await this.#readOperation(parsed.context.operationId);
+    if (loaded.status === "error") {
+      return loaded;
+    }
+    if (loaded.record !== undefined) {
+      return this.#resolveExistingForApproval(parsed.context, loaded.record);
+    }
+
+    const prepared = await this.#prepare(parsed.context.input);
+    return prepared.status === "error" ? prepared : approvalFor(prepared.edit);
+  }
+
+  async recordApprovalRejection(
+    input: unknown,
+    options: ToolExecutionOptions = {},
+  ): Promise<ToolError | undefined> {
+    const parsed = this.#operationContext(input, options.operationId);
+    if (parsed.status === "error") {
+      return parsed.error;
+    }
+    const context = parsed.context;
+    const loaded = await this.#readOperation(context.operationId);
+    if (loaded.status === "error") {
+      return loaded.error;
+    }
+    if (
+      loaded.record !== undefined &&
+      !sameOperation(context, loaded.record)
+    ) {
+      return operationConflictError(context.operationId);
+    }
+    if (
+      loaded.record?.state === "applied" ||
+      loaded.record?.state === "cancelled" ||
+      loaded.record?.state === "conflict"
+    ) {
+      return undefined;
+    }
+
+    try {
+      await this.#operationStore.write({
+        schemaVersion: 1,
+        operationId: context.operationId,
+        requestFingerprint: context.requestFingerprint,
+        workspaceRoot: this.#workspaceRoot,
+        path: context.input.path,
+        state: "cancelled",
+      });
+      return undefined;
+    } catch {
+      return operationCheckpointError(
+        context.operationId,
+        "none",
+        "The user rejected Edit, but Runtime could not save its cancelled operation record.",
+      );
+    }
   }
 
   async execute(
@@ -146,49 +256,107 @@ export class EditTool implements RuntimeTool {
       return toolError("cancelled", "Edit was cancelled before it started.");
     }
 
-    const prepared = await this.#prepare(input);
-    if (prepared.status === "error") {
-      return prepared;
+    const parsed = this.#operationContext(input, options.operationId);
+    if (parsed.status === "error") {
+      return parsed;
     }
+    const context = parsed.context;
+    const loaded = await this.#readOperation(context.operationId);
+    if (loaded.status === "error") {
+      return loaded;
+    }
+
+    let pending: PendingEditOperationRecord;
+    let prepared: PreparedEdit;
+    if (loaded.record === undefined) {
+      const preparation = await this.#prepare(context.input);
+      if (preparation.status === "error") {
+        return preparation;
+      }
+      prepared = preparation.edit;
+      pending = pendingRecord(context, prepared, this.#workspaceRoot);
+      try {
+        await this.#operationStore.write(pending);
+      } catch {
+        return {
+          status: "error",
+          error: operationCheckpointError(
+            context.operationId,
+            "none",
+            "Edit did not write the file because Runtime could not save its pending operation record.",
+          ),
+        };
+      }
+    } else {
+      const existing = await this.#resolveExistingForExecution(
+        context,
+        loaded.record,
+      );
+      if (existing.status !== "ready") {
+        return existing;
+      }
+      pending = existing.pending;
+      prepared = existing.edit;
+    }
+
     if (isAborted(options.signal)) {
+      const cancellationError = await this.recordApprovalRejection(
+        input,
+        options,
+      );
+      if (cancellationError !== undefined) {
+        return { status: "error", error: cancellationError };
+      }
       return toolError("cancelled", "Edit was cancelled before it wrote the file.");
     }
 
     const writeError = await atomicReplace(
-      prepared.edit.canonicalPath,
-      prepared.edit.candidate,
-      prepared.edit.mode,
+      prepared.canonicalPath,
+      prepared.candidate,
+      prepared.mode,
     );
     if (writeError !== undefined) {
       return { status: "error", error: writeError };
     }
 
     const verified = await verifyReplacement(
-      prepared.edit.canonicalPath,
-      prepared.edit.candidate,
+      prepared.canonicalPath,
+      prepared.candidate,
     );
     if (verified.status === "error") {
       return verified;
     }
 
-    return {
-      status: "success",
-      output: {
-        path: prepared.edit.displayPath,
-        replacements: 1,
-        beforeVersion: prepared.edit.beforeVersion,
-        afterVersion: issueFileVersionToken(
-          prepared.edit.displayPath,
-          verified.version,
-          this.#fileVersionSecret,
-        ),
-        diff: prepared.edit.diff,
-        verified: true,
-      } satisfies EditResult,
+    const applied: AppliedEditOperationRecord = {
+      ...pending,
+      state: "applied",
+      afterVersion: issueFileVersionToken(
+        prepared.displayPath,
+        verified.version,
+        this.#fileVersionSecret,
+      ),
     };
+    try {
+      await this.#operationStore.write(applied);
+    } catch {
+      return {
+        status: "error",
+        error: operationCheckpointError(
+          context.operationId,
+          "applied",
+          "Edit changed and verified the file, but Runtime could not save its applied operation record.",
+        ),
+      };
+    }
+    return { status: "success", output: resultFromApplied(applied) };
   }
 
-  async #prepare(input: unknown): Promise<PreparedEditOutcome> {
+  #operationContext(
+    input: unknown,
+    operationId: string | undefined,
+  ):
+    | { readonly status: "ready"; readonly context: EditOperationContext }
+    | { readonly status: "error"; readonly error: ToolError } {
     const parsed = editArgumentsSchema.safeParse(input);
     if (!parsed.success) {
       return editError(
@@ -202,22 +370,247 @@ export class EditTool implements RuntimeTool {
         "Edit requires old_string and new_string to be different.",
       );
     }
+    if (operationId === undefined || operationId.trim().length === 0) {
+      return editError(
+        "missing_operation_id",
+        "Core must assign Edit a stable operation identity before Runtime can execute it.",
+      );
+    }
 
+    const intent: EditOperationIntent = {
+      path: parsed.data.path,
+      oldString: parsed.data.old_string,
+      newString: parsed.data.new_string,
+      expectedVersion: parsed.data.expected_version,
+    };
+    return {
+      status: "ready",
+      context: {
+        operationId,
+        workspaceRoot: this.#workspaceRoot,
+        input: parsed.data,
+        intent,
+        requestFingerprint: operationFingerprint(
+          this.#workspaceRoot,
+          intent,
+        ),
+      },
+    };
+  }
+
+  async #readOperation(
+    operationId: string,
+  ): Promise<
+    | { readonly status: "ready"; readonly record?: EditOperationRecord }
+    | { readonly status: "error"; readonly error: ToolError }
+  > {
+    try {
+      const record = await this.#operationStore.read(operationId);
+      return {
+        status: "ready",
+        ...(record === undefined ? {} : { record }),
+      };
+    } catch {
+      return editError(
+        "operation_store_failed",
+        "Runtime could not read the private Edit operation record. No file was written.",
+        { operationId },
+      );
+    }
+  }
+
+  async #resolveExistingForApproval(
+    context: EditOperationContext,
+    record: EditOperationRecord,
+  ): Promise<ToolApprovalPreparation> {
+    if (!sameOperation(context, record)) {
+      return {
+        status: "error",
+        error: operationConflictError(context.operationId),
+      };
+    }
+    if (record.state === "applied") {
+      return {
+        status: "resolved",
+        outcome: { status: "success", output: resultFromApplied(record) },
+      };
+    }
+    if (record.state === "cancelled") {
+      return editError(
+        "operation_cancelled",
+        "This Edit operation was previously cancelled and will not be executed.",
+        { operationId: context.operationId },
+      );
+    }
+    if (record.state === "conflict") {
+      return {
+        status: "error",
+        error: operationConflictError(context.operationId),
+      };
+    }
+
+    const resolution = await this.#resolvePending(record);
+    if (resolution.status === "error") {
+      return resolution;
+    }
+    if (resolution.status === "after") {
+      return {
+        status: "resolved",
+        outcome: {
+          status: "success",
+          output: resultFromApplied(resolution.applied),
+        },
+      };
+    }
+    return approvalFor(resolution.edit);
+  }
+
+  async #resolveExistingForExecution(
+    context: EditOperationContext,
+    record: EditOperationRecord,
+  ): Promise<ExistingExecutionResolution> {
+    if (!sameOperation(context, record)) {
+      return {
+        status: "error",
+        error: operationConflictError(context.operationId),
+      };
+    }
+    if (record.state === "applied") {
+      return { status: "success", output: resultFromApplied(record) };
+    }
+    if (record.state === "cancelled") {
+      return toolError(
+        "operation_cancelled",
+        "This Edit operation was previously cancelled and will not be executed.",
+        false,
+        { operationId: context.operationId },
+      );
+    }
+    if (record.state === "conflict") {
+      return {
+        status: "error",
+        error: operationConflictError(context.operationId),
+      };
+    }
+
+    const resolution = await this.#resolvePending(record);
+    if (resolution.status === "error") {
+      return resolution;
+    }
+    if (resolution.status === "after") {
+      return {
+        status: "success",
+        output: resultFromApplied(resolution.applied),
+      };
+    }
+    return {
+      status: "ready",
+      edit: resolution.edit,
+      pending: resolution.pending,
+    };
+  }
+
+  async #resolvePending(
+    pending: PendingEditOperationRecord,
+  ): Promise<PendingResolution> {
     const location = await resolveWorkspaceFile(
       this.#workspaceRoot,
-      parsed.data.path,
+      pending.intent.path,
     );
+    if (location.status === "error") {
+      return this.#recordConflict(pending, location.error.code);
+    }
+    const snapshot = await readSnapshot(location.canonicalPath);
+    if (snapshot.status === "error") {
+      return this.#recordConflict(pending, snapshot.error.code);
+    }
+
+    const currentHash = contentHash(snapshot.content);
+    if (currentHash === pending.afterContentHash) {
+      const applied: AppliedEditOperationRecord = {
+        ...pending,
+        state: "applied",
+        afterVersion: issueFileVersionToken(
+          location.displayPath,
+          snapshot.version,
+          this.#fileVersionSecret,
+        ),
+      };
+      try {
+        await this.#operationStore.write(applied);
+      } catch {
+        return {
+          status: "error",
+          error: operationCheckpointError(
+            pending.operationId,
+            "applied",
+            "Runtime verified that the Edit already happened, but could not save its applied operation record.",
+          ),
+        };
+      }
+      return { status: "after", applied };
+    }
+    if (currentHash !== pending.beforeContentHash) {
+      return this.#recordConflict(pending, "file_content_changed");
+    }
+
+    const prepared = prepareFromSnapshot(
+      location,
+      snapshot,
+      pending.intent,
+      issueFileVersionToken(
+        location.displayPath,
+        snapshot.version,
+        this.#fileVersionSecret,
+      ),
+    );
+    if (
+      prepared.status === "error" ||
+      prepared.edit.afterContentHash !== pending.afterContentHash
+    ) {
+      return this.#recordConflict(pending, "stored_intent_mismatch");
+    }
+    return { status: "before", edit: prepared.edit, pending };
+  }
+
+  async #recordConflict(
+    pending: PendingEditOperationRecord,
+    reason: string,
+  ): Promise<PendingResolution> {
+    try {
+      await this.#operationStore.write({
+        ...pending,
+        state: "conflict",
+        reason,
+      });
+    } catch {
+      return {
+        status: "error",
+        error: operationCheckpointError(
+          pending.operationId,
+          "none",
+          "Runtime detected an Edit recovery conflict but could not save that state. No file was written.",
+        ),
+      };
+    }
+    return {
+      status: "error",
+      error: operationConflictError(pending.operationId, pending.displayPath),
+    };
+  }
+
+  async #prepare(input: EditInput): Promise<PreparedEditOutcome> {
+    const location = await resolveWorkspaceFile(this.#workspaceRoot, input.path);
     if (location.status === "error") {
       return location;
     }
-
     const snapshot = await readSnapshot(location.canonicalPath);
     if (snapshot.status === "error") {
       return snapshot;
     }
     if (
       !matchesFileVersionToken(
-        parsed.data.expected_version,
+        input.expected_version,
         location.displayPath,
         snapshot.version,
         this.#fileVersionSecret,
@@ -229,67 +622,183 @@ export class EditTool implements RuntimeTool {
         { path: location.displayPath },
       );
     }
-
-    const matchIndexes = findMatchIndexes(
-      snapshot.content,
-      parsed.data.old_string,
-    );
-    if (matchIndexes.length === 0) {
-      return editError(
-        "old_string_not_found",
-        "old_string does not occur in the current file. Read it again and provide exact current text.",
-        { path: location.displayPath },
-      );
-    }
-    if (matchIndexes.length > 1) {
-      return editError(
-        "ambiguous_match",
-        `old_string matches ${matchIndexes.length} locations. Include more surrounding text so it matches exactly once.`,
-        ambiguousMatchDetails(
-          location.displayPath,
-          snapshot.content,
-          matchIndexes,
-        ),
-      );
-    }
-
-    const matchIndex = matchIndexes[0];
-    if (matchIndex === undefined) {
-      return editError("edit_failed", "Edit could not select the unique match.");
-    }
-    const candidate =
-      snapshot.content.slice(0, matchIndex) +
-      parsed.data.new_string +
-      snapshot.content.slice(matchIndex + parsed.data.old_string.length);
-    return {
-      status: "ready",
-      edit: {
-        canonicalPath: location.canonicalPath,
-        displayPath: location.displayPath,
-        beforeVersion: parsed.data.expected_version,
-        candidate,
-        diff: formatDiff(
-          location.displayPath,
-          snapshot.content,
-          matchIndex,
-          parsed.data.old_string,
-          parsed.data.new_string,
-        ),
-        mode: snapshot.mode,
+    return prepareFromSnapshot(
+      location,
+      snapshot,
+      {
+        path: input.path,
+        oldString: input.old_string,
+        newString: input.new_string,
+        expectedVersion: input.expected_version,
       },
-    };
+      input.expected_version,
+    );
   }
+}
+
+function approvalFor(edit: PreparedEdit): ToolApprovalPreparation {
+  return {
+    status: "approval_required",
+    approval: {
+      kind: "file_edit",
+      path: edit.displayPath,
+      beforeVersion: edit.beforeVersion,
+      diff: edit.diff,
+    },
+  };
+}
+
+function prepareFromSnapshot(
+  location: WorkspaceFileLocation,
+  snapshot: FileSnapshot,
+  intent: EditOperationIntent,
+  beforeVersion: string,
+): PreparedEditOutcome {
+  const matchIndexes = findMatchIndexes(snapshot.content, intent.oldString);
+  if (matchIndexes.length === 0) {
+    return editError(
+      "old_string_not_found",
+      "old_string does not occur in the current file. Read it again and provide exact current text.",
+      { path: location.displayPath },
+    );
+  }
+  if (matchIndexes.length > 1) {
+    return editError(
+      "ambiguous_match",
+      `old_string matches ${matchIndexes.length} locations. Include more surrounding text so it matches exactly once.`,
+      ambiguousMatchDetails(
+        location.displayPath,
+        snapshot.content,
+        matchIndexes,
+      ),
+    );
+  }
+
+  const matchIndex = matchIndexes[0];
+  if (matchIndex === undefined) {
+    return editError("edit_failed", "Edit could not select the unique match.");
+  }
+  const candidate =
+    snapshot.content.slice(0, matchIndex) +
+    intent.newString +
+    snapshot.content.slice(matchIndex + intent.oldString.length);
+  return {
+    status: "ready",
+    edit: {
+      canonicalPath: location.canonicalPath,
+      displayPath: location.displayPath,
+      beforeVersion,
+      candidate,
+      beforeContentHash: contentHash(snapshot.content),
+      afterContentHash: contentHash(candidate),
+      diff: formatDiff(
+        location.displayPath,
+        snapshot.content,
+        matchIndex,
+        intent.oldString,
+        intent.newString,
+      ),
+      mode: snapshot.mode,
+    },
+  };
+}
+
+function pendingRecord(
+  context: EditOperationContext,
+  edit: PreparedEdit,
+  workspaceRoot: string,
+): PendingEditOperationRecord {
+  return {
+    schemaVersion: 1,
+    operationId: context.operationId,
+    requestFingerprint: context.requestFingerprint,
+    workspaceRoot,
+    displayPath: edit.displayPath,
+    intent: context.intent,
+    beforeContentHash: edit.beforeContentHash,
+    afterContentHash: edit.afterContentHash,
+    diff: edit.diff,
+    state: "pending",
+  };
+}
+
+function resultFromApplied(record: AppliedEditOperationRecord): EditResult {
+  return {
+    path: record.displayPath,
+    replacements: 1,
+    beforeVersion: record.intent.expectedVersion,
+    afterVersion: record.afterVersion,
+    diff: record.diff,
+    verified: true,
+  };
+}
+
+function sameOperation(
+  context: EditOperationContext,
+  record: EditOperationRecord,
+): boolean {
+  return (
+    context.operationId === record.operationId &&
+    context.requestFingerprint === record.requestFingerprint &&
+    record.workspaceRoot === context.workspaceRoot
+  );
+}
+
+function operationFingerprint(
+  workspaceRoot: string,
+  intent: EditOperationIntent,
+): string {
+  return createHash("sha256")
+    .update(
+      JSON.stringify([
+        workspaceRoot,
+        intent.path,
+        intent.oldString,
+        intent.newString,
+        intent.expectedVersion,
+      ]),
+    )
+    .digest("hex");
+}
+
+function contentHash(content: string): string {
+  return createHash("sha256").update(content, "utf8").digest("hex");
+}
+
+function operationConflictError(
+  operationId: string,
+  path?: string,
+): ToolError {
+  return {
+    code: "operation_conflict",
+    message:
+      "This Edit operation identity belongs to different arguments or the file is neither the recorded before nor after content. No file was written.",
+    retryable: false,
+    details: {
+      operationId,
+      ...(path === undefined ? {} : { path }),
+    },
+  };
+}
+
+function operationCheckpointError(
+  operationId: string,
+  sideEffectOutcome: "none" | "applied",
+  message: string,
+): ToolError {
+  return {
+    code: "operation_checkpoint_failed",
+    message,
+    retryable: false,
+    details: { operationId, sideEffectOutcome },
+  };
 }
 
 async function resolveWorkspaceFile(
   workspaceRoot: string,
   requestedPath: string,
 ): Promise<
-  | {
-      readonly status: "ready";
-      readonly canonicalPath: string;
-      readonly displayPath: string;
-    }
+  | WorkspaceFileLocation
   | { readonly status: "error"; readonly error: ToolError }
 > {
   if (
@@ -337,12 +846,7 @@ async function resolveWorkspaceFile(
 async function readSnapshot(
   canonicalPath: string,
 ): Promise<
-  | {
-      readonly status: "ready";
-      readonly content: string;
-      readonly version: ReturnType<typeof toFileVersion>;
-      readonly mode: number;
-    }
+  | FileSnapshot
   | { readonly status: "error"; readonly error: ToolError }
 > {
   let fileHandle;

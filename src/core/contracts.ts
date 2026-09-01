@@ -78,6 +78,7 @@ export type AgentMessage =
     }
   | {
       readonly role: "tool";
+      readonly operationId: string;
       readonly toolCallId: string;
       readonly toolName: string;
       readonly observation: Observation;
@@ -157,6 +158,7 @@ export interface ToolExecutor {
 }
 
 export interface ToolExecutionOptions {
+  readonly operationId?: string;
   readonly signal?: AbortSignal;
   readonly requestApproval?: ToolApprovalHandler;
 }
@@ -198,7 +200,12 @@ export type RunEvent =
       readonly delayMs: number;
       readonly errorKind: ProviderErrorKind;
     }
-  | { readonly type: "tool_call"; readonly step: number; readonly call: ToolCall }
+  | {
+      readonly type: "tool_call";
+      readonly step: number;
+      readonly operationId: string;
+      readonly call: ToolCall;
+    }
   | {
       readonly type: "observation";
       readonly step: number;

@@ -1,3 +1,5 @@
+import { randomUUID } from "node:crypto";
+
 import type {
   AgentMessage,
   ModelProvider,
@@ -240,13 +242,19 @@ export class AgentCore {
           return this.#stopped(step, messages, "cancelled", options.onEvent);
         }
         seenToolCallIds.add(call.id);
+        const operationId = randomUUID();
         this.#transition({
           type: "execute_tool",
           step,
           toolCallId: call.id,
           toolName: call.name,
         });
-        this.#emit(options.onEvent, { type: "tool_call", step, call });
+        this.#emit(options.onEvent, {
+          type: "tool_call",
+          step,
+          operationId,
+          call,
+        });
         if (isSignalAborted(options.signal)) {
           return this.#stopped(step, messages, "cancelled", options.onEvent);
         }
@@ -254,6 +262,7 @@ export class AgentCore {
         let observation: Observation;
         try {
           observation = await this.#runtime.execute(call, {
+            operationId,
             ...(options.signal === undefined ? {} : { signal: options.signal }),
             ...(options.requestApproval === undefined
               ? {}
@@ -284,6 +293,7 @@ export class AgentCore {
 
         messages.push({
           role: "tool",
+          operationId,
           toolCallId: call.id,
           toolName: call.name,
           observation,

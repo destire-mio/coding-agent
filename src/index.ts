@@ -34,6 +34,20 @@ export { BashTool } from "./runtime/bash-tool.js";
 export type { BashResult, BashToolOptions } from "./runtime/bash-tool.js";
 export { EditTool } from "./runtime/edit-tool.js";
 export type { EditResult, EditToolOptions } from "./runtime/edit-tool.js";
+export {
+  EditOperationStore,
+  EditOperationStoreConfigurationError,
+  EditOperationStoreError,
+} from "./runtime/edit-operation-store.js";
+export type {
+  AppliedEditOperationRecord,
+  CancelledEditOperationRecord,
+  ConflictEditOperationRecord,
+  EditOperationIntent,
+  EditOperationRecord,
+  EditOperationStoreOptions,
+  PendingEditOperationRecord,
+} from "./runtime/edit-operation-store.js";
 export { GrepTool } from "./runtime/grep-tool.js";
 export { ReadTool } from "./runtime/read-tool.js";
 export {
@@ -47,4 +61,7 @@ export type {
   ToolOutputWriter,
 } from "./runtime/tool-output-store.js";
 export { ToolRuntime } from "./runtime/tool-runtime.js";
-export type { BashRuntimeOptions } from "./runtime/tool-runtime.js";
+export type {
+  BashRuntimeOptions,
+  EditRuntimeOptions,
+} from "./runtime/tool-runtime.js";

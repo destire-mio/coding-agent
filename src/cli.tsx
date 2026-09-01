@@ -8,6 +8,9 @@ import { AgentCore } from "./core/agent-core.js";
 import { ConfigurationError, loadProviderConfig } from "./provider/config.js";
 import { OpenAICompatibleProvider } from "./provider/openai-compatible-provider.js";
 import { BashConfigurationError } from "./runtime/bash-tool.js";
+import {
+  EditOperationStoreConfigurationError,
+} from "./runtime/edit-operation-store.js";
 import { WorkspaceConfigurationError } from "./runtime/read-tool.js";
 import { ToolRuntime } from "./runtime/tool-runtime.js";
 import { ToolOutputStoreConfigurationError } from "./runtime/tool-output-store.js";
@@ -37,6 +40,7 @@ async function main(): Promise<number> {
     if (
       error instanceof ConfigurationError ||
       error instanceof BashConfigurationError ||
+      error instanceof EditOperationStoreConfigurationError ||
       error instanceof ToolOutputStoreConfigurationError ||
       error instanceof WorkspaceConfigurationError
     ) {

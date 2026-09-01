@@ -171,7 +171,7 @@ it("routes Esc through the Core state machine and cancels the provider request",
   );
 
   await providerStarted;
-  await renderTurn();
+  await renderTurn(50);
   expect(view.lastFrame()).toContain("running… · Esc to cancel");
 
   view.stdin.write("\u001B");

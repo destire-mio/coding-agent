@@ -37,6 +37,7 @@ try {
   const runtime = await ToolRuntime.withEdit({
     workspaceRoot: workspace,
     toolOutputRoot: join(root, "tool-output"),
+    editOperationRoot: join(root, "edit-operations"),
   });
   const core = new AgentCore(provider, runtime, { maxSteps: 6 });
   const approvals: ToolApprovalRequest[] = [];

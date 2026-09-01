@@ -9,6 +9,10 @@ import type {
   ToolExecutor,
 } from "../core/contracts.js";
 import { BashTool } from "./bash-tool.js";
+import {
+  EditOperationStore,
+  EditOperationStoreConfigurationError,
+} from "./edit-operation-store.js";
 import { EditTool } from "./edit-tool.js";
 import { createFileVersionSecret } from "./file-version.js";
 import { GrepTool } from "./grep-tool.js";
@@ -23,6 +27,10 @@ export interface BashRuntimeOptions {
   readonly workspaceRoot: string;
   readonly maxReadBytes?: number;
   readonly toolOutputRoot?: string;
+}
+
+export interface EditRuntimeOptions extends BashRuntimeOptions {
+  readonly editOperationRoot?: string;
 }
 
 export class ToolRuntime implements ToolExecutor {
@@ -76,7 +84,7 @@ export class ToolRuntime implements ToolExecutor {
     ]);
   }
 
-  static async withEdit(options: BashRuntimeOptions): Promise<ToolRuntime> {
+  static async withEdit(options: EditRuntimeOptions): Promise<ToolRuntime> {
     const outputStore = await ToolOutputStore.create({
       ...(options.toolOutputRoot === undefined
         ? {}
@@ -88,6 +96,16 @@ export class ToolRuntime implements ToolExecutor {
     if (isWithin(workspaceRoot, outputStore.rootPath)) {
       throw new ToolOutputStoreConfigurationError(
         "The private tool output store must be outside the workspace.",
+      );
+    }
+    const operationStore = await EditOperationStore.create({
+      ...(options.editOperationRoot === undefined
+        ? {}
+        : { root: options.editOperationRoot }),
+    });
+    if (isWithin(workspaceRoot, operationStore.rootPath)) {
+      throw new EditOperationStoreConfigurationError(
+        "The private Edit operation store must be outside the workspace.",
       );
     }
     const fileVersionSecret = createFileVersionSecret();
@@ -108,6 +126,7 @@ export class ToolRuntime implements ToolExecutor {
       await EditTool.create({
         workspaceRoot: options.workspaceRoot,
         fileVersionSecret,
+        operationStore,
       }),
     ]);
   }
@@ -143,7 +162,7 @@ export class ToolRuntime implements ToolExecutor {
     if (tool.prepareApproval !== undefined) {
       let preparation;
       try {
-        preparation = await tool.prepareApproval(input);
+        preparation = await tool.prepareApproval(input, options);
       } catch {
         return errorObservation(
           call,
@@ -158,6 +177,9 @@ export class ToolRuntime implements ToolExecutor {
           status: "error",
           error: preparation.error,
         };
+      }
+      if (preparation.status === "resolved") {
+        return observationFromOutcome(call, preparation.outcome);
       }
 
       if (options.requestApproval === undefined) {
@@ -177,6 +199,28 @@ export class ToolRuntime implements ToolExecutor {
         options.signal,
       );
       if (decision === "rejected") {
+        if (tool.recordApprovalRejection !== undefined) {
+          try {
+            const rejectionError = await tool.recordApprovalRejection(
+              input,
+              options,
+            );
+            if (rejectionError !== undefined) {
+              return {
+                toolCallId: call.id,
+                toolName: call.name,
+                status: "error",
+                error: rejectionError,
+              };
+            }
+          } catch {
+            return errorObservation(
+              call,
+              "tool_internal_error",
+              "The tool failed unexpectedly while recording rejection.",
+            );
+          }
+        }
         return errorObservation(
           call,
           "approval_rejected",
@@ -190,20 +234,7 @@ export class ToolRuntime implements ToolExecutor {
 
     try {
       const outcome = await tool.execute(input, options);
-      if (outcome.status === "success") {
-        return {
-          toolCallId: call.id,
-          toolName: call.name,
-          status: "success",
-          output: outcome.output,
-        };
-      }
-      return {
-        toolCallId: call.id,
-        toolName: call.name,
-        status: "error",
-        error: outcome.error,
-      };
+      return observationFromOutcome(call, outcome);
     } catch {
       return errorObservation(
         call,
@@ -212,6 +243,26 @@ export class ToolRuntime implements ToolExecutor {
       );
     }
   }
+}
+
+function observationFromOutcome(
+  call: ToolCall,
+  outcome: Awaited<ReturnType<RuntimeTool["execute"]>>,
+): Observation {
+  if (outcome.status === "success") {
+    return {
+      toolCallId: call.id,
+      toolName: call.name,
+      status: "success",
+      output: outcome.output,
+    };
+  }
+  return {
+    toolCallId: call.id,
+    toolName: call.name,
+    status: "error",
+    error: outcome.error,
+  };
 }
 
 function isWithin(root: string, candidate: string): boolean {

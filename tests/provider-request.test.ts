@@ -69,6 +69,7 @@ describe("DeepSeek Chat Completions request", () => {
         },
         {
           role: "tool",
+          operationId: "operation-readme",
           toolCallId: "call-readme",
           toolName: "read",
           observation: {

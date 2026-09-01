@@ -90,10 +90,26 @@ requests a fresh approval for that path, version, and diff. After approval,
 Runtime rechecks the same precondition, writes a complete temporary file in the
 target directory, atomically renames it over the target, and reads it back before
 returning success. A change made while approval is pending therefore returns
-`stale_file` with zero Agent writes. If the whole CLI crashes after rename but
-before Core records the Observation, the dead process cannot return an error;
-the current milestone has no durable operation journal, so a later run must Read
-the file and must not blindly replay the Edit.
+`stale_file` with zero Agent writes.
+
+Core assigns every tool execution an internal `operationId` that is separate
+from the Provider's `toolCallId`; the model cannot choose it. For Edit, Runtime
+stores a private operation record under
+`~/.coding-agent/state/edit-operations/` by default. The record is written as
+`pending` before the workspace rename and as `applied` only after read-back.
+The store must remain outside the workspace and uses directory mode `0700` and
+atomic `0600` JSON record replacement.
+
+After a restart, a redelivered pending operation compares the current file with
+the recorded before and intended-after content hashes. Intended-after is
+accepted as already applied without another write; unchanged before content
+requires the same diff to be approved again; any third content becomes a
+terminal `operation_conflict`. Replaying an applied operation returns its stored
+success, while a rejected operation leaves a minimal `cancelled` tombstone.
+Reusing one operation identity with different arguments is always rejected.
+This is the Edit side-effect recovery primitive, not full Session recovery: the
+CLI does not yet persist and automatically resume the old model conversation.
+Operation-record expiry and garbage collection are also not yet implemented.
 
 Core also owns the lifecycle of one active run:
 
@@ -189,6 +205,10 @@ Bash output
 Edit output
 = path + one replacement + before/after versions + approved diff + read-back proof
 
+Edit operation record
+= Core operationId + request fingerprint + pending/applied/conflict/cancelled
+  Runtime state outside the workspace
+
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
 
@@ -280,6 +300,10 @@ The deterministic suite covers:
   with zero writes, stale-version rejection before and after approval, explicit
   ambiguous-match locations, workspace escapes, atomic replacement, mode
   preservation, post-write Read verification, and Core Read → Edit → final flow;
+- Edit operation identity, private-store failure with zero writes, applied
+  replay without another approval or rename, both restart crash windows,
+  recovery re-approval, conflict detection, cancelled tombstones, and
+  same-ID/different-arguments rejection;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
@@ -389,14 +413,25 @@ unique selection by default, and put writes behind approval. Kimi also exposes
 an explicit `replace_all`; this milestone omits it and adds a Read-issued version
 precondition, same-directory atomic replacement, and post-write verification.
 
+Kimi's v2
+[`toolDedupe`](https://github.com/MoonshotAI/kimi-code/blob/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b/packages/agent-core-v2/src/agent/toolDedupe/toolDedupeService.ts)
+is per-turn loop protection: same-step duplicates share one result, while
+cross-step repeats receive reminders. Its state is not the durable Edit outcome
+journal needed for a process crash. This project therefore keeps a small
+Runtime-owned Edit record instead of importing Kimi's complete Session/Wire
+persistence layer before the Session milestone.
+
 ## Current security boundary
 
 - The local CLI registers `read`, `grep`, foreground-only `bash`, and exact
   `edit`. Every Bash call requires a fresh approval after Runtime validates its
   arguments and the TUI displays the exact command and canonical workspace cwd.
-- Every Edit requires a fresh approval for a Runtime-generated path/version/diff.
-  Runtime revalidates the file version after approval and never automatically
-  retries a stale or unverified edit.
+- Every new Edit execution requires a fresh approval for a Runtime-generated
+  path/version/diff. Replaying an already applied identity returns its stored
+  result without another write. Runtime revalidates the file version after
+  approval and never automatically retries a stale or unverified edit. Edit
+  operation records remain private and cannot be addressed through the
+  model-visible Read tool.
 - Read accepts exactly one workspace-relative path or Runtime output ref. Paths
   are canonicalized and paths or symlinks resolving outside the workspace are
   rejected. Refs grant access to one private output file and cannot be used to
@@ -427,7 +462,7 @@ precondition, same-directory atomic replacement, and post-write verification.
 
 ## Status
 
-On 2026-09-01, the deterministic suite passed 107 tests across 16 test files. The
+On 2026-09-01, the deterministic suite passed 116 tests across 16 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -448,7 +483,9 @@ termination, unknown outcomes, complete private stdout/stderr persistence,
 ref-based Read paging, restart reopening, and capability/path/cursor rejection.
 Edit tests cover version-bound approval, explicit ambiguous-match evidence,
 stale changes during approval, atomic replacement, permission preservation,
-post-write verification, TUI diff display, and the complete Core loop.
+post-write verification, TUI diff display, the complete Core loop, stable
+operation identities, restart reconciliation, duplicate delivery, cancelled
+tombstones, and conflict fail-closed behavior.
 
 The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
@@ -469,8 +506,10 @@ The compiled TUI also completed a real `package.json` Read,
 retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.
 
-This proves the current minimum chain runs; it does not yet prove the later
-production-strength Provider, sandbox, Session, or recovery milestones.
+This proves the current minimum chain and deterministic Edit side-effect
+recovery primitive run. It does not yet prove automatic Session/Turn resumption,
+power-loss durability, a hostile-workspace sandbox, or the later complete
+production milestone.
 
 ## License
 
