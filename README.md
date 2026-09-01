@@ -136,10 +136,12 @@ ToolCall. More than one is rejected with zero tool execution. A Turn can still
 perform `Read → Edit → final` across separate model responses. This milestone
 can now fold a transcript into `no_turn`, `awaiting_model`, `recovering_tool`,
 or `finished`, and rebuild the latest unfinished Turn's paired model messages.
-Mismatched Tool Intent and Observation identities fail closed. The CLI does not
-yet discover or resume an old Session, execute recovery, build later-Turn
-Context, compact history, list multiple Sessions, or garbage-collect transcript
-data.
+Mismatched Tool Intent and Observation identities fail closed. Core can resume
+an `awaiting_model` state only when it is attached to the same Session writer;
+it sends the rebuilt messages to the Provider without replaying an already
+observed tool and durably appends the new terminal result. The CLI does not yet
+select an old Session, and Core does not yet execute `recovering_tool`, build
+later-Turn Context, compact history, list Sessions, or garbage-collect data.
 
 Core also owns the lifecycle of one active run:
 

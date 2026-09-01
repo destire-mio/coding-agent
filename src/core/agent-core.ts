@@ -38,6 +38,9 @@ import type {
   SessionEventInput,
   SessionEventWriter,
 } from "../session/session-transcript-store.js";
+import type {
+  AwaitingModelResumeState,
+} from "../session/session-transcript-fold.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a coding agent operating inside one workspace.
 Use grep to locate unknown content or file locations, and read when a concrete path is known.
@@ -113,9 +116,7 @@ export class AgentCore {
   }
 
   async run(userInput: string, options: RunOptions = {}): Promise<RunResult> {
-    if (this.#activeController !== undefined) {
-      throw new Error("AgentCore already has an active run.");
-    }
+    this.#requireNoActiveRun();
 
     const prompt = userInput.trim();
     const messages: AgentMessage[] = [];
@@ -131,8 +132,44 @@ export class AgentCore {
       return result;
     }
 
-    const controller = new AbortController();
     const turnId = randomUUID();
+    return this.#executeTurn(turnId, options, (activeOptions) =>
+      this.#runLoop(prompt, turnId, activeOptions),
+    );
+  }
+
+  async resume(
+    state: AwaitingModelResumeState,
+    options: RunOptions = {},
+  ): Promise<RunResult> {
+    this.#requireNoActiveRun();
+    if (
+      this.#session === undefined ||
+      this.#session.sessionId !== state.sessionId
+    ) {
+      throw new Error(
+        "AgentCore resume requires the matching Session event writer.",
+      );
+    }
+
+    const messages = [...state.messages];
+    return this.#executeTurn(state.turnId, options, (activeOptions) =>
+      this.#continueLoop(
+        messages,
+        state.turnId,
+        state.nextStep,
+        collectToolCallIds(messages),
+        activeOptions,
+      ),
+    );
+  }
+
+  async #executeTurn(
+    turnId: string,
+    options: RunOptions,
+    execute: (options: RunOptions) => Promise<RunResult>,
+  ): Promise<RunResult> {
+    const controller = new AbortController();
     this.#transition({ type: "start" });
     this.#activeController = controller;
 
@@ -146,7 +183,7 @@ export class AgentCore {
     }
 
     try {
-      let result = await this.#runLoop(prompt, turnId, {
+      let result = await execute({
         signal: controller.signal,
         ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
         ...(options.requestApproval === undefined
@@ -184,9 +221,23 @@ export class AgentCore {
     ) {
       return this.#sessionFailure(0, messages);
     }
-    const seenToolCallIds = new Set<string>();
+    return this.#continueLoop(
+      messages,
+      turnId,
+      1,
+      new Set<string>(),
+      options,
+    );
+  }
 
-    for (let step = 1; step <= this.#maxSteps; step += 1) {
+  async #continueLoop(
+    messages: AgentMessage[],
+    turnId: string,
+    startStep: number,
+    seenToolCallIds: Set<string>,
+    options: RunOptions,
+  ): Promise<RunResult> {
+    for (let step = startStep; step <= this.#maxSteps; step += 1) {
       if (isSignalAborted(options.signal)) {
         return this.#stopped(step - 1, messages, "cancelled");
       }
@@ -356,6 +407,12 @@ export class AgentCore {
     }
 
     return this.#stopped(this.#maxSteps, messages, "max_steps");
+  }
+
+  #requireNoActiveRun(): void {
+    if (this.#activeController !== undefined) {
+      throw new Error("AgentCore already has an active run.");
+    }
   }
 
   async #completeModel(
@@ -649,6 +706,16 @@ type ModelCompletionOutcome =
 
 function isSignalAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
+}
+
+function collectToolCallIds(messages: readonly AgentMessage[]): Set<string> {
+  return new Set(
+    messages.flatMap((message) =>
+      message.role === "assistant"
+        ? message.toolCalls.map((call) => call.id)
+        : [],
+    ),
+  );
 }
 
 function runOutcome(result: RunResult) {

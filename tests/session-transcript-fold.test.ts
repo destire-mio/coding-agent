@@ -3,6 +3,12 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 
+import { AgentCore } from "../src/core/agent-core.js";
+import type {
+  ModelProvider,
+  ModelRequest,
+  ToolExecutor,
+} from "../src/core/contracts.js";
 import { foldSessionTranscript } from "../src/session/session-transcript-fold.js";
 import {
   SessionTranscriptCorruptError,
@@ -26,6 +32,7 @@ describe("Session transcript fold", () => {
 
     expect(foldSessionTranscript(await store.load())).toEqual({
       kind: "no_turn",
+      sessionId: "fold-empty",
     });
   });
 
@@ -35,6 +42,7 @@ describe("Session transcript fold", () => {
 
     expect(foldSessionTranscript(await store.load())).toEqual({
       kind: "awaiting_model",
+      sessionId: "fold-user",
       turnId: "turn-user",
       nextStep: 1,
       messages: [{ role: "user", content: "Read README.md" }],
@@ -134,6 +142,89 @@ describe("Session transcript fold", () => {
     expect(() => foldSessionTranscript(events)).toThrow(
       SessionTranscriptCorruptError,
     );
+  });
+});
+
+describe("Core awaiting-model resume", () => {
+  it("continues from a durable Observation without executing the tool again", async () => {
+    const store = await createStore("resume-observation");
+    await appendTurnStart(store, "turn-resume");
+    await store.append(intent("turn-resume"));
+    await store.append(observation("turn-resume"));
+    const state = foldSessionTranscript(await store.load());
+    if (state.kind !== "awaiting_model") {
+      throw new Error("Expected an awaiting-model recovery state.");
+    }
+
+    const requests: ModelRequest[] = [];
+    const provider: ModelProvider = {
+      complete: async (request) => {
+        requests.push(request);
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "README summary" }],
+        };
+      },
+    };
+    let runtimeCalls = 0;
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        runtimeCalls += 1;
+        throw new Error("The recovered Read must not execute again.");
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      session: store,
+      maxSteps: 4,
+    });
+
+    const result = await core.resume(state);
+
+    expect(result).toMatchObject({
+      kind: "final_answer",
+      answer: "README summary",
+      steps: 2,
+    });
+    expect(runtimeCalls).toBe(0);
+    expect(requests).toHaveLength(1);
+    expect(requests[0]?.messages).toEqual(state.messages);
+    expect((await store.load()).map((event) => event.type)).toEqual([
+      "session_started",
+      "turn_started",
+      "tool_intent",
+      "tool_observation",
+      "turn_finished",
+    ]);
+  });
+
+  it("refuses to append a resumed Turn to a different Session", async () => {
+    const source = await createStore("resume-source");
+    await appendTurnStart(source, "turn-source");
+    const state = foldSessionTranscript(await source.load());
+    if (state.kind !== "awaiting_model") {
+      throw new Error("Expected an awaiting-model recovery state.");
+    }
+    const destination = await createStore("resume-destination");
+    const provider: ModelProvider = {
+      complete: async () => {
+        throw new Error("The Provider must not run for a mismatched Session.");
+      },
+    };
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        throw new Error("The Runtime must not run for a mismatched Session.");
+      },
+    };
+    const core = new AgentCore(provider, runtime, { session: destination });
+
+    await expect(core.resume(state)).rejects.toThrow(
+      "AgentCore resume requires the matching Session event writer.",
+    );
+    expect((await destination.load()).map((event) => event.type)).toEqual([
+      "session_started",
+    ]);
   });
 });
 
