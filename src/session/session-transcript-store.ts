@@ -9,8 +9,10 @@ import {
   stat,
 } from "node:fs/promises";
 import { homedir } from "node:os";
-import { isAbsolute, join, relative, resolve } from "node:path";
+import { dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { z } from "zod";
+
+import { SessionRunLease } from "./session-run-lease.js";
 
 const SESSION_ID_PATTERN = /^[A-Za-z0-9_-]{1,128}$/;
 
@@ -136,6 +138,12 @@ export interface SessionTranscriptOpenOptions {
   readonly sessionId: string;
 }
 
+export interface OpenedSessionRun {
+  readonly session: SessionTranscriptStore;
+  readonly lease: SessionRunLease;
+  readonly events: readonly SessionEvent[];
+}
+
 export class SessionTranscriptConfigurationError extends Error {}
 export class SessionTranscriptError extends Error {}
 export class SessionTranscriptCorruptError extends SessionTranscriptError {}
@@ -249,6 +257,28 @@ export class SessionTranscriptStore implements SessionEventWriter {
   static async open(
     options: SessionTranscriptOpenOptions,
   ): Promise<SessionTranscriptStore> {
+    const store = await SessionTranscriptStore.#locateExisting(options);
+    await store.#assertIdentity();
+    return store;
+  }
+
+  static async openForRun(
+    options: SessionTranscriptOpenOptions,
+  ): Promise<OpenedSessionRun> {
+    const session = await SessionTranscriptStore.#locateExisting(options);
+    const lease = await session.acquireRunLease();
+    try {
+      const events = await session.#assertIdentity();
+      return { session, lease, events };
+    } catch (error) {
+      await lease.release().catch(() => undefined);
+      throw error;
+    }
+  }
+
+  static async #locateExisting(
+    options: SessionTranscriptOpenOptions,
+  ): Promise<SessionTranscriptStore> {
     validateSessionId(options.sessionId);
 
     try {
@@ -324,16 +354,6 @@ export class SessionTranscriptStore implements SessionEventWriter {
         workspaceRoot,
         transcriptPath,
       );
-      const events = await store.load();
-      const first = events[0];
-      if (
-        first?.type !== "session_started" ||
-        first.workspaceRoot !== workspaceRoot
-      ) {
-        throw new SessionTranscriptCorruptError(
-          "The Session transcript identity is invalid.",
-        );
-      }
       return store;
     } catch (error) {
       if (
@@ -346,6 +366,24 @@ export class SessionTranscriptStore implements SessionEventWriter {
         "The private Session store could not be opened.",
       );
     }
+  }
+
+  async acquireRunLease(): Promise<SessionRunLease> {
+    return SessionRunLease.acquire(this.#sessionId, dirname(this.#transcriptPath));
+  }
+
+  async #assertIdentity(): Promise<readonly SessionEvent[]> {
+    const events = await this.load();
+    const first = events[0];
+    if (
+      first?.type !== "session_started" ||
+      first.workspaceRoot !== this.#workspaceRoot
+    ) {
+      throw new SessionTranscriptCorruptError(
+        "The Session transcript identity is invalid.",
+      );
+    }
+    return events;
   }
 
   async append(event: SessionEventInput): Promise<void> {

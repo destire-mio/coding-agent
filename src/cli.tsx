@@ -23,6 +23,11 @@ import {
   foldSessionTranscript,
   type ResumableSessionState,
 } from "./session/session-transcript-fold.js";
+import {
+  SessionBusyError,
+  type SessionRunLease,
+  SessionRunLeaseError,
+} from "./session/session-run-lease.js";
 import { AgentApp } from "./tui/agent-app.js";
 
 interface CliOptions {
@@ -51,85 +56,104 @@ async function main(): Promise<number> {
     return 2;
   }
 
-  let providerConfig;
-  let runtime: ToolRuntime;
-  let session: SessionTranscriptStore | undefined;
-  let resumeState: ResumableSessionState | undefined;
+  let lease: SessionRunLease | undefined;
   const configuredSessionRoot = process.env.CODING_AGENT_SESSION_ROOT?.trim();
   const sessionRoot =
     configuredSessionRoot === undefined || configuredSessionRoot.length === 0
       ? undefined
       : resolve(configuredSessionRoot);
   try {
-    if (options.continueSessionId !== undefined) {
-      session = await SessionTranscriptStore.open({
-        workspaceRoot: options.workspace,
-        sessionId: options.continueSessionId,
-        ...(sessionRoot === undefined ? {} : { root: sessionRoot }),
-      });
-      const state = foldSessionTranscript(await session.load());
-      if (state.kind === "no_turn") {
-        process.stderr.write(
-          `Session ${state.sessionId} has no unfinished Turn to resume.\n`,
-        );
-        return 1;
+    let providerConfig;
+    let runtime: ToolRuntime;
+    let session: SessionTranscriptStore | undefined;
+    let resumeState: ResumableSessionState | undefined;
+    try {
+      if (options.continueSessionId !== undefined) {
+        const opened = await SessionTranscriptStore.openForRun({
+          workspaceRoot: options.workspace,
+          sessionId: options.continueSessionId,
+          ...(sessionRoot === undefined ? {} : { root: sessionRoot }),
+        });
+        session = opened.session;
+        lease = opened.lease;
+        const state = foldSessionTranscript(opened.events);
+        if (state.kind === "no_turn") {
+          process.stderr.write(
+            `Session ${state.sessionId} has no unfinished Turn to resume.\n`,
+          );
+          return 1;
+        }
+        if (state.kind === "finished") {
+          process.stderr.write(
+            `Session ${state.sessionId} is already finished (${state.turn.outcome}).\n`,
+          );
+          return 1;
+        }
+        resumeState = state;
       }
-      if (state.kind === "finished") {
-        process.stderr.write(
-          `Session ${state.sessionId} is already finished (${state.turn.outcome}).\n`,
-        );
-        return 1;
-      }
-      resumeState = state;
-    }
 
-    providerConfig = loadProviderConfig();
-    runtime = await ToolRuntime.withEdit({ workspaceRoot: options.workspace });
-    session ??= await SessionTranscriptStore.create({
-      workspaceRoot: options.workspace,
-      ...(sessionRoot === undefined ? {} : { root: sessionRoot }),
-    });
-  } catch (error) {
-    if (
-      error instanceof ConfigurationError ||
-      error instanceof BashConfigurationError ||
-      error instanceof EditOperationStoreConfigurationError ||
-      error instanceof SessionTranscriptConfigurationError ||
-      error instanceof SessionTranscriptError ||
-      error instanceof ToolOutputStoreConfigurationError ||
-      error instanceof WorkspaceConfigurationError
-    ) {
-      process.stderr.write(`${error.message}\n`);
+      providerConfig = loadProviderConfig();
+      runtime = await ToolRuntime.withEdit({ workspaceRoot: options.workspace });
+      if (session === undefined) {
+        session = await SessionTranscriptStore.create({
+          workspaceRoot: options.workspace,
+          ...(sessionRoot === undefined ? {} : { root: sessionRoot }),
+        });
+        lease = await session.acquireRunLease();
+      }
+    } catch (error) {
+      if (error instanceof SessionBusyError) {
+        process.stderr.write(`${error.message}\n`);
+        return 1;
+      }
+      if (
+        error instanceof ConfigurationError ||
+        error instanceof BashConfigurationError ||
+        error instanceof EditOperationStoreConfigurationError ||
+        error instanceof SessionRunLeaseError ||
+        error instanceof SessionTranscriptConfigurationError ||
+        error instanceof SessionTranscriptError ||
+        error instanceof ToolOutputStoreConfigurationError ||
+        error instanceof WorkspaceConfigurationError
+      ) {
+        process.stderr.write(`${error.message}\n`);
+        return 2;
+      }
+      process.stderr.write("Failed to initialize the coding agent.\n");
       return 2;
     }
-    process.stderr.write("Failed to initialize the coding agent.\n");
-    return 2;
-  }
-  if (session === undefined) {
-    process.stderr.write("Failed to initialize the Session.\n");
-    return 2;
-  }
-  const provider = new OpenAICompatibleProvider(providerConfig);
-  const core = new AgentCore(provider, runtime, {
-    maxSteps: options.maxSteps,
-    session,
-  });
-  let exitCode = 1;
+    if (session === undefined) {
+      process.stderr.write("Failed to initialize the Session.\n");
+      return 2;
+    }
+    const provider = new OpenAICompatibleProvider(providerConfig);
+    const core = new AgentCore(provider, runtime, {
+      maxSteps: options.maxSteps,
+      session,
+    });
+    let exitCode = 1;
 
-  const app = render(
-    <AgentApp
-      core={core}
-      workspace={options.workspace}
-      sessionId={session.sessionId}
-      {...(options.prompt === undefined ? {} : { initialPrompt: options.prompt })}
-      {...(resumeState === undefined ? {} : { resumeState })}
-      onComplete={(result) => {
-        exitCode = result.kind === "final_answer" ? 0 : 1;
-      }}
-    />,
-  );
-  await app.waitUntilExit();
-  return exitCode;
+    const app = render(
+      <AgentApp
+        core={core}
+        workspace={options.workspace}
+        sessionId={session.sessionId}
+        {...(options.prompt === undefined ? {} : { initialPrompt: options.prompt })}
+        {...(resumeState === undefined ? {} : { resumeState })}
+        onComplete={(result) => {
+          exitCode = result.kind === "final_answer" ? 0 : 1;
+        }}
+      />,
+    );
+    await app.waitUntilExit();
+    return exitCode;
+  } finally {
+    if (lease !== undefined) {
+      await lease.release().catch((error: unknown) => {
+        process.stderr.write(`${safeMessage(error)}\n`);
+      });
+    }
+  }
 }
 
 function parseArguments(arguments_: readonly string[]): CliOptions {

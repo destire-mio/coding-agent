@@ -148,6 +148,16 @@ the exact Session named by `--continue`; it does not automatically select a
 recent Session, build later-Turn Context, compact history, list Sessions, or
 garbage-collect data.
 
+Every new or resumed CLI run holds one exclusive `.run.lock` in that Session's
+private directory from the pre-fold read through the terminal write. A competing
+`--continue` fails immediately with `session_busy`, before Provider or Runtime
+initialization. The winner acquires the lock and only then loads and folds the
+Transcript, so it cannot continue from a pre-lock snapshot. Normal exit releases
+the lock; a killed process leaves a heartbeat-based lock that becomes stale after
+5 seconds and can then be acquired by a fresh process. This is cooperative
+single-writer coordination, not protection against a hostile process deleting
+private state.
+
 Core also owns the lifecycle of one active run:
 
 ```text
@@ -431,6 +441,14 @@ unfinished Session. It re-executes recoverable read-only tools, reconciles Edit
 through its durable journal, and writes a synthetic
 `recovery_unknown_outcome` Observation instead of re-executing Bash.
 
+The cross-process Session critical section was checked against Kimi Code's
+[`OAuthManager`](https://github.com/MoonshotAI/kimi-code/blob/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b/packages/oauth/src/oauth-manager.ts#L163-L220)
+at the same pinned commit. Both use `proper-lockfile`, fail closed when locking
+cannot be established, and re-read durable state after acquisition. Kimi's OAuth
+refresh waits and retries because callers want one refreshed credential; this
+interactive Session boundary deliberately uses zero retries so a second terminal
+gets an immediate `session_busy` result instead of silently running later.
+
 The Thinking round-trip was separately checked against Kimi Code at pinned
 commit
 [`619564d`](https://github.com/MoonshotAI/kimi-code/tree/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b).
@@ -530,7 +548,7 @@ importing Kimi's complete Session/Wire stack.
 
 ## Status
 
-On 2026-09-01, the deterministic suite passed 141 tests across 18 test files. The
+On 2026-09-02, the deterministic suite passed 143 tests across 19 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -558,10 +576,14 @@ operation identities, restart reconciliation, duplicate delivery, cancelled
 tombstones, and conflict fail-closed behavior.
 
 A compiled-CLI recovery smoke opens an explicitly selected unfinished Session
-in a fresh Node process, rebuilds the durable Read Observation, sends exactly one
-Provider request, and persists the returned final answer. Store and TUI tests
-also prove that opening an unknown Session does not create it and that an
-observed tool is not executed again during resume.
+in a fresh Node process while a second compiled CLI competes for the same ID.
+The winner rebuilds the durable Read Observation, sends exactly one Provider
+request, and persists the returned final answer; the loser exits with
+`session_busy` and sends zero Provider requests. Store and TUI tests also prove
+that opening an unknown Session does not create it and that an observed tool is
+not executed again during resume. A separate real child-process test kills the
+lock holder with `SIGKILL`, observes the lease remain busy until its 5-second
+stale boundary, and then acquires it from a new process.
 
 The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
@@ -584,8 +606,9 @@ retained `step 1 thinking › ...` in the visible trajectory, and displayed
 
 This proves the current minimum chain, deterministic Edit side-effect recovery,
 durable Session write-ahead ordering, and explicit same-Turn continuation from a
-fresh CLI process. It does not yet prove automatic latest-Session selection,
-later-Turn Context projection, power-loss durability at every write boundary, a
+fresh CLI process with one active writer. It does not yet prove automatic
+latest-Session selection, later-Turn Context projection, power-loss durability
+at every write boundary, hostile-process resistance for the cooperative lock, a
 hostile-workspace sandbox, or the later complete production milestone.
 
 ## License

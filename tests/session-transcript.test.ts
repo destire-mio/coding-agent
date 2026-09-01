@@ -19,6 +19,7 @@ import type {
   ToolCall,
 } from "../src/core/contracts.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
+import { SessionBusyError } from "../src/session/session-run-lease.js";
 import {
   SessionTranscriptConfigurationError,
   SessionTranscriptCorruptError,
@@ -167,6 +168,19 @@ describe("Session transcript JSONL", () => {
     await expect(stat(join(workspaceBucket, "session-missing"))).rejects.toMatchObject(
       { code: "ENOENT" },
     );
+  });
+
+  it("allows only one active runner for a Session", async () => {
+    const harness = await createStore("session-single-runner");
+    const first = await harness.store.acquireRunLease();
+
+    await expect(harness.store.acquireRunLease()).rejects.toBeInstanceOf(
+      SessionBusyError,
+    );
+
+    await first.release();
+    const next = await harness.store.acquireRunLease();
+    await next.release();
   });
 });
 

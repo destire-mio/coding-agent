@@ -73,12 +73,18 @@ export {
   SessionTranscriptStore,
 } from "./session/session-transcript-store.js";
 export type {
+  OpenedSessionRun,
   SessionEvent,
   SessionEventInput,
   SessionEventWriter,
   SessionTranscriptOpenOptions,
   SessionTranscriptStoreOptions,
 } from "./session/session-transcript-store.js";
+export {
+  SessionBusyError,
+  SessionRunLease,
+  SessionRunLeaseError,
+} from "./session/session-run-lease.js";
 export { foldSessionTranscript } from "./session/session-transcript-fold.js";
 export type {
   AwaitingModelResumeState,
