@@ -1,4 +1,5 @@
 import type {
+  ToolApprovalDetails,
   ToolDefinition,
   ToolError,
   ToolExecutionOptions,
@@ -11,8 +12,7 @@ export type ToolOutcome =
 export type ToolApprovalPreparation =
   | {
       readonly status: "approval_required";
-      readonly command: string;
-      readonly cwd: string;
+      readonly approval: ToolApprovalDetails;
     }
   | { readonly status: "error"; readonly error: ToolError };
 

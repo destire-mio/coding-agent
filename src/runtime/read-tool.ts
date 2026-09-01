@@ -1,5 +1,5 @@
 import { createHmac, randomBytes, timingSafeEqual } from "node:crypto";
-import { constants, type BigIntStats } from "node:fs";
+import { constants } from "node:fs";
 import { open, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { z } from "zod";
@@ -8,6 +8,12 @@ import type { ToolDefinition } from "../core/contracts.js";
 import type { RuntimeTool, ToolOutcome } from "./tool.js";
 import { toolError } from "./tool.js";
 import type { ToolOutputStore } from "./tool-output-store.js";
+import {
+  createFileVersionSecret,
+  issueFileVersionToken,
+  sameFileVersion,
+  toFileVersion,
+} from "./file-version.js";
 
 const DEFAULT_MAX_READ_BYTES = 128 * 1024;
 const MAX_CURSOR_LENGTH = 2048;
@@ -88,13 +94,13 @@ const readCursorSchema = z
   })
   .strict();
 
-type FileVersion = z.infer<typeof fileVersionSchema>;
 type ReadCursor = z.infer<typeof readCursorSchema>;
 
 export interface ReadToolOptions {
   readonly workspaceRoot: string;
   readonly maxReadBytes?: number;
   readonly toolOutputStore?: ToolOutputStore;
+  readonly fileVersionSecret?: Uint8Array;
 }
 
 export class WorkspaceConfigurationError extends Error {}
@@ -105,29 +111,32 @@ export class ReadTool implements RuntimeTool {
   readonly #workspaceRoot: string;
   readonly #maxReadBytes: number;
   readonly #cursorSecret: Buffer;
+  readonly #fileVersionSecret: Buffer;
   readonly #toolOutputStore: ToolOutputStore | undefined;
 
   private constructor(
     workspaceRoot: string,
     maxReadBytes: number,
     cursorSecret: Buffer,
+    fileVersionSecret: Uint8Array,
     toolOutputStore: ToolOutputStore | undefined,
   ) {
     this.#workspaceRoot = workspaceRoot;
     this.#maxReadBytes = maxReadBytes;
     this.#cursorSecret = cursorSecret;
+    this.#fileVersionSecret = Buffer.from(fileVersionSecret);
     this.#toolOutputStore = toolOutputStore;
     this.definition = toolOutputStore === undefined
       ? {
           name: "read",
           description:
-            "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
+            "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. Preserve the returned version for a later Edit. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
           inputSchema: workspaceReadInputSchema,
         }
       : {
           name: "read",
           description:
-            "Read one bounded UTF-8 text page from exactly one source: either a workspace-relative path or a Bash stdoutRef/stderrRef. Never send both. When complete is false, repeat the same path or ref with the returned nextCursor.",
+            "Read one bounded UTF-8 text page from exactly one source: either a workspace-relative path or a Bash stdoutRef/stderrRef. Never send both. A workspace path returns a version for a later Edit. When complete is false, repeat the same path or ref with the returned nextCursor.",
           inputSchema: refReadInputSchema,
         };
   }
@@ -160,6 +169,7 @@ export class ReadTool implements RuntimeTool {
       workspaceRoot,
       maxReadBytes,
       randomBytes(CURSOR_SECRET_BYTES),
+      options.fileVersionSecret ?? createFileVersionSecret(),
       options.toolOutputStore,
     );
   }
@@ -359,6 +369,15 @@ export class ReadTool implements RuntimeTool {
         status: "success",
         output: {
           ...source,
+          ...("path" in source
+            ? {
+                version: issueFileVersionToken(
+                  source.path,
+                  initialVersion,
+                  this.#fileVersionSecret,
+                ),
+              }
+            : {}),
           bytes: pageBytes.byteLength,
           fileBytes,
           content,
@@ -404,26 +423,6 @@ function isWithin(root: string, candidate: string): boolean {
 
 function toPortableRelativePath(root: string, candidate: string): string {
   return relative(root, candidate).split(sep).join("/");
-}
-
-function toFileVersion(fileStat: BigIntStats): FileVersion {
-  return {
-    device: fileStat.dev.toString(),
-    inode: fileStat.ino.toString(),
-    size: fileStat.size.toString(),
-    modifiedNs: fileStat.mtimeNs.toString(),
-    changedNs: fileStat.ctimeNs.toString(),
-  };
-}
-
-function sameFileVersion(left: FileVersion, right: FileVersion): boolean {
-  return (
-    left.device === right.device &&
-    left.inode === right.inode &&
-    left.size === right.size &&
-    left.modifiedNs === right.modifiedNs &&
-    left.changedNs === right.changedNs
-  );
 }
 
 function encodeCursor(

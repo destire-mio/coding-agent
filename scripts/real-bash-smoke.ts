@@ -86,6 +86,9 @@ try {
     {
       requestApproval: async (request) => {
         approvalRequests.push(request);
+        if (request.kind !== "command") {
+          return "rejected";
+        }
         process.stderr.write(
           `${JSON.stringify({
             event: "approval_requested",
@@ -253,7 +256,9 @@ try {
         toolSequence: toolObservations.map((message) => message.toolName),
         approvalVerified: true,
         approvedCommand,
-        approvedCwdWasTemporaryWorkspace: approvalRequests[0]?.cwd === workspace,
+        approvedCwdWasTemporaryWorkspace:
+          approvalRequests[0]?.kind === "command" &&
+          approvalRequests[0].cwd === workspace,
         bashExecutedOnce: bashMessages.length === 1,
         stdoutTruncated: bashResult.stdoutTruncated,
         readPages: successfulReadMessages.length,

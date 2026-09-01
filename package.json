@@ -17,6 +17,7 @@
     "smoke:real": "tsx scripts/real-smoke.ts",
     "smoke:grep": "tsx scripts/real-grep-smoke.ts",
     "smoke:bash": "tsx scripts/real-bash-smoke.ts",
+    "smoke:edit": "tsx scripts/real-edit-smoke.ts",
     "verify": "npm run typecheck && npm run test:run && npm run build"
   },
   "repository": {

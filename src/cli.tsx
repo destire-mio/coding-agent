@@ -32,7 +32,7 @@ async function main(): Promise<number> {
   let runtime: ToolRuntime;
   try {
     providerConfig = loadProviderConfig();
-    runtime = await ToolRuntime.withBash({ workspaceRoot: options.workspace });
+    runtime = await ToolRuntime.withEdit({ workspaceRoot: options.workspace });
   } catch (error) {
     if (
       error instanceof ConfigurationError ||

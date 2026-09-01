@@ -31,7 +31,7 @@ describe("ToolRuntime", () => {
       {
         name: "read",
         description:
-          "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
+          "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. Preserve the returned version for a later Edit. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
         inputSchema: {
           type: "object",
           properties: {
@@ -98,6 +98,7 @@ describe("ToolRuntime", () => {
     if (observation.status === "success") {
       expect(observation.output).toEqual({
         path: "README.md",
+        version: expect.stringMatching(/^file-version-v1:/),
         bytes: 21,
         fileBytes: 21,
         content: "hello from workspace\n",

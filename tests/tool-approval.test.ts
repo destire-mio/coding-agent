@@ -35,6 +35,7 @@ describe("ToolRuntime approval gate", () => {
       {
         toolCallId: "call-bash",
         toolName: "bash",
+        kind: "command",
         command: "npm test",
         cwd: "/workspace",
       },
@@ -106,8 +107,11 @@ class ApprovalProbeTool implements RuntimeTool {
     }
     return {
       status: "approval_required",
-      command,
-      cwd: "/workspace",
+      approval: {
+        kind: "command",
+        command,
+        cwd: "/workspace",
+      },
     };
   }
 

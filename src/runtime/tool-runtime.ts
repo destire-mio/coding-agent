@@ -9,6 +9,8 @@ import type {
   ToolExecutor,
 } from "../core/contracts.js";
 import { BashTool } from "./bash-tool.js";
+import { EditTool } from "./edit-tool.js";
+import { createFileVersionSecret } from "./file-version.js";
 import { GrepTool } from "./grep-tool.js";
 import { ReadTool, type ReadToolOptions } from "./read-tool.js";
 import type { RuntimeTool } from "./tool.js";
@@ -74,6 +76,42 @@ export class ToolRuntime implements ToolExecutor {
     ]);
   }
 
+  static async withEdit(options: BashRuntimeOptions): Promise<ToolRuntime> {
+    const outputStore = await ToolOutputStore.create({
+      ...(options.toolOutputRoot === undefined
+        ? {}
+        : { root: options.toolOutputRoot }),
+    });
+    const workspaceRoot = await realpath(options.workspaceRoot).catch(
+      () => options.workspaceRoot,
+    );
+    if (isWithin(workspaceRoot, outputStore.rootPath)) {
+      throw new ToolOutputStoreConfigurationError(
+        "The private tool output store must be outside the workspace.",
+      );
+    }
+    const fileVersionSecret = createFileVersionSecret();
+    return new ToolRuntime([
+      await ReadTool.create({
+        workspaceRoot: options.workspaceRoot,
+        ...(options.maxReadBytes === undefined
+          ? {}
+          : { maxReadBytes: options.maxReadBytes }),
+        toolOutputStore: outputStore,
+        fileVersionSecret,
+      }),
+      await GrepTool.create({ workspaceRoot: options.workspaceRoot }),
+      await BashTool.create({
+        workspaceRoot: options.workspaceRoot,
+        outputStore,
+      }),
+      await EditTool.create({
+        workspaceRoot: options.workspaceRoot,
+        fileVersionSecret,
+      }),
+    ]);
+  }
+
   definitions(): readonly ToolDefinition[] {
     return [...this.#tools.values()].map((tool) => tool.definition);
   }
@@ -134,8 +172,7 @@ export class ToolRuntime implements ToolExecutor {
         {
           toolCallId: call.id,
           toolName: call.name,
-          command: preparation.command,
-          cwd: preparation.cwd,
+          ...preparation.approval,
         },
         options.signal,
       );

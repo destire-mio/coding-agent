@@ -181,8 +181,11 @@ export class BashTool implements RuntimeTool {
     }
     return {
       status: "approval_required",
-      command: parsed.data.command,
-      cwd: this.#workspaceRoot,
+      approval: {
+        kind: "command",
+        command: parsed.data.command,
+        cwd: this.#workspaceRoot,
+      },
     };
   }
 

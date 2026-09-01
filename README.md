@@ -3,7 +3,7 @@
 A build-to-learn Coding Agent project aiming for a runnable, explainable,
 testable, production-grade v1.
 
-## Current milestone: workspace ReAct loop and foreground Bash
+## Current milestone: workspace ReAct loop, Bash, and exact Edit
 
 The first vertical slice is implemented around one real task:
 
@@ -75,6 +75,25 @@ same ref without an old cursor. Log expiry and garbage collection are not yet
 implemented; retained files currently require explicit local cleanup. Binary
 output is preserved in the log, but the current text-only Read tool rejects a
 ref whose requested page is not valid UTF-8.
+
+Workspace-path Read Observations also include an opaque, process-local file
+`version`. Edit accepts only `path`, `old_string`, `new_string`, and that exact
+`expected_version`. Runtime rejects a stale version, a missing old string, or
+more than one exact match before requesting approval. An ambiguous-match
+Observation includes bounded line, column, and source previews so the model can
+choose a more precise string instead of guessing. The first Edit deliberately
+does not expose `replace_all`, arbitrary whole-file overwrite, or multi-file
+patches.
+
+For a valid proposal, Runtime computes the actual before/after diff and the TUI
+requests a fresh approval for that path, version, and diff. After approval,
+Runtime rechecks the same precondition, writes a complete temporary file in the
+target directory, atomically renames it over the target, and reads it back before
+returning success. A change made while approval is pending therefore returns
+`stale_file` with zero Agent writes. If the whole CLI crashes after rename but
+before Core records the Observation, the dead process cannot return an error;
+the current milestone has no durable operation journal, so a later run must Read
+the file and must not blindly replay the Edit.
 
 Core also owns the lifecycle of one active run:
 
@@ -157,7 +176,8 @@ Observation
 = Runtime evidence: matching toolCallId + success/output or error/code
 
 Read page output
-= content + page byte count/line metadata + complete + optional nextCursor
+= workspace version when applicable + content + page byte count/line metadata
+  + complete + optional nextCursor
 
 Grep page output
 = pattern + path + bounded matches(path/line/text) + complete + optional nextCursor
@@ -165,6 +185,9 @@ Grep page output
 Bash output
 = command + cwd + exitCode/signal + bounded stdout/stderr + separate
   stdoutRef/stderrRef + process outcome
+
+Edit output
+= path + one replacement + before/after versions + approved diff + read-back proof
 
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
@@ -253,6 +276,10 @@ The deterministic suite covers:
 - complete Bash stdout/stderr streaming to separate private logs, capability-ref
   Read paging, exact reconstruction after truncation and restart, forged/cross-ref
   rejection, and timeout/cancellation evidence recovery;
+- exact Edit schema, Read-issued file versions, fresh diff approval, rejection
+  with zero writes, stale-version rejection before and after approval, explicit
+  ambiguous-match locations, workspace escapes, atomic replacement, mode
+  preservation, post-write Read verification, and Core Read → Edit → final flow;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
@@ -282,6 +309,7 @@ credentials:
 node --env-file=.env --import tsx scripts/real-smoke.ts
 node --env-file=.env --import tsx scripts/real-grep-smoke.ts
 node --env-file=.env --import tsx scripts/real-bash-smoke.ts
+node --env-file=.env --import tsx scripts/real-edit-smoke.ts
 ```
 
 The Read smoke creates a temporary workspace whose marker exists only on the
@@ -297,6 +325,11 @@ temporary workspace. It requires the real model to observe truncation, page the
 private `stdoutRef` without rerunning Bash, reconstruct 33,076 bytes exactly,
 recover a marker absent from the preview, and confirm the Provider credential
 was not inherited by the child process.
+The Edit smoke creates a temporary file whose markers are unique to that run. It
+requires the real model to Read first, pass the exact returned version into one
+Edit, receive approval for the Runtime-generated diff, and use the successful
+Observation in its final answer. The oracle independently verifies the exact
+disk content and a fresh Read of the returned after-version.
 
 ## Design reference
 
@@ -349,11 +382,21 @@ and later read in bounded pages. This project does not expose Kimi-style private
 filesystem paths to the model; Runtime returns an unguessable single-file ref
 and authorizes it separately from workspace paths.
 
+Edit was compared at pinned commit `619564d` against
+[`packages/agent-core/src/tools/builtin/file/edit.ts`](https://github.com/MoonshotAI/kimi-code/blob/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b/packages/agent-core/src/tools/builtin/file/edit.ts).
+Both tools use exact string replacement, reject no-op or missing matches, require
+unique selection by default, and put writes behind approval. Kimi also exposes
+an explicit `replace_all`; this milestone omits it and adds a Read-issued version
+precondition, same-directory atomic replacement, and post-write verification.
+
 ## Current security boundary
 
-- The local CLI registers `read`, `grep`, and foreground-only `bash`. Every Bash
-  call requires a fresh approval after Runtime validates its arguments and the
-  TUI displays the exact command and canonical workspace cwd.
+- The local CLI registers `read`, `grep`, foreground-only `bash`, and exact
+  `edit`. Every Bash call requires a fresh approval after Runtime validates its
+  arguments and the TUI displays the exact command and canonical workspace cwd.
+- Every Edit requires a fresh approval for a Runtime-generated path/version/diff.
+  Runtime revalidates the file version after approval and never automatically
+  retries a stale or unverified edit.
 - Read accepts exactly one workspace-relative path or Runtime output ref. Paths
   are canonicalized and paths or symlinks resolving outside the workspace are
   rejected. Refs grant access to one private output file and cannot be used to
@@ -378,12 +421,13 @@ and authorizes it separately from workspace paths.
   leftovers. It may still access files, processes, or networks available to the
   current user and may leave side effects before timeout or cancellation; this
   is not an OS sandbox and an unknown outcome is never automatically retried.
-- Edit, MCP, plugins, long-term Session/Memory, multi-agent behavior, background
-  task management, and a complex TUI are intentionally absent.
+- Arbitrary overwrite, multi-file Edit, MCP, plugins, long-term Session/Memory,
+  multi-agent behavior, background task management, and a complex TUI are
+  intentionally absent.
 
 ## Status
 
-On 2026-09-01, the deterministic suite passed 97 tests across 15 test files. The
+On 2026-09-01, the deterministic suite passed 107 tests across 16 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -402,8 +446,11 @@ partial-result discard, and Runtime cancellation of the fixed ripgrep process.
 Bash tests cover the approval gate, fixed cwd and environment, process-group
 termination, unknown outcomes, complete private stdout/stderr persistence,
 ref-based Read paging, restart reopening, and capability/path/cursor rejection.
+Edit tests cover version-bound approval, explicit ambiguous-match evidence,
+stale changes during approval, atomic replacement, permission preservation,
+post-write verification, TUI diff display, and the complete Core loop.
 
-The real-provider Read, Grep, and Bash smokes passed with DeepSeek Thinking. Read
+The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
 safe marker, and did not expose the `.env` marker. Both streamed reasoning,
 tool-call arguments, and final text through 3 Provider attempts with 0 retries.
@@ -414,6 +461,10 @@ returned the hidden marker plus `ProviderSecret: absent` without rerunning Bash.
 This real run also caught that DeepSeek rejected a top-level `anyOf` Read schema
 with HTTP 400. The model-visible contract now uses a compatible flat object,
 while Runtime's Zod validation still enforces exactly one of `path` or `ref`.
+The Edit smoke completed `read → edit → final` in 3 steps and 3 Provider attempts
+with 0 retries. Runtime approved the exact diff, the old marker disappeared, a
+fresh disk Read matched the returned after-version, and the final answer included
+the new marker.
 The compiled TUI also completed a real `package.json` Read,
 retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.

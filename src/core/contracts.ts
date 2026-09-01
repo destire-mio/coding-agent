@@ -27,12 +27,23 @@ export interface ToolError {
   readonly details?: unknown;
 }
 
-export interface ToolApprovalRequest {
+export type ToolApprovalDetails =
+  | {
+      readonly kind: "command";
+      readonly command: string;
+      readonly cwd: string;
+    }
+  | {
+      readonly kind: "file_edit";
+      readonly path: string;
+      readonly beforeVersion: string;
+      readonly diff: string;
+    };
+
+export type ToolApprovalRequest = ToolApprovalDetails & {
   readonly toolCallId: string;
   readonly toolName: string;
-  readonly command: string;
-  readonly cwd: string;
-}
+};
 
 export type ToolApprovalDecision = "approved" | "rejected";
 

@@ -259,6 +259,73 @@ it("shows the exact dangerous tool request and rejects it before execution", asy
   view.unmount();
 });
 
+it("shows the Runtime-generated Edit diff and rejects it before writing", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-edit-approval-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  const tool = new TuiEditApprovalProbeTool();
+  const runtime = new ToolRuntime([tool]);
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [],
+      calls: [
+        {
+          id: "call-tui-edit",
+          name: "edit",
+          rawArguments: JSON.stringify({
+            path: "config.ts",
+            old_string: "timeout=120",
+            new_string: "timeout=180",
+            expected_version: "file-version-v1:test",
+          }),
+        },
+      ],
+    },
+    {
+      kind: "final",
+      content: [{ type: "text", text: "The edit was rejected." }],
+    },
+  ]);
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="修改超时"
+      onComplete={finish}
+    />,
+  );
+
+  await waitForFrame(view, "approval required: edit");
+  expect(view.lastFrame()).toContain("path: config.ts");
+  expect(view.lastFrame()).toContain("version: file-version-v1:test");
+  expect(view.lastFrame()).toContain("-timeout=120");
+  expect(view.lastFrame()).toContain("+timeout=180");
+
+  view.stdin.write("n");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result.kind).toBe("final_answer");
+  expect(tool.executionCount).toBe(0);
+  expect(
+    result.messages.some(
+      (message) =>
+        message.role === "tool" &&
+        message.observation.status === "error" &&
+        message.observation.error.code === "approval_rejected",
+    ),
+  ).toBe(true);
+  view.unmount();
+});
+
 it("cancels a pending approval without executing the dangerous tool", async () => {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-approval-cancel-"));
   temporaryRoots.push(root);
@@ -484,8 +551,48 @@ class TuiApprovalProbeTool implements RuntimeTool {
     }
     return {
       status: "approval_required",
-      command,
-      cwd: this.#workspace,
+      approval: {
+        kind: "command",
+        command,
+        cwd: this.#workspace,
+      },
+    };
+  }
+
+  async execute(): Promise<ToolOutcome> {
+    this.executionCount += 1;
+    return { status: "success", output: { executed: true } };
+  }
+}
+
+class TuiEditApprovalProbeTool implements RuntimeTool {
+  readonly definition = {
+    name: "edit",
+    description: "Edit approval TUI test tool.",
+    inputSchema: {
+      type: "object",
+      properties: { path: { type: "string" } },
+      required: ["path"],
+      additionalProperties: true,
+    },
+  };
+  executionCount = 0;
+
+  prepareApproval(): ToolApprovalPreparation {
+    return {
+      status: "approval_required",
+      approval: {
+        kind: "file_edit",
+        path: "config.ts",
+        beforeVersion: "file-version-v1:test",
+        diff: [
+          "--- a/config.ts",
+          "+++ b/config.ts",
+          "@@ line 1 @@",
+          "-timeout=120",
+          "+timeout=180",
+        ].join("\n"),
+      },
     };
   }
 

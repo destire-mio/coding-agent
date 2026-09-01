@@ -17,6 +17,7 @@ export type {
   RunStopReason,
   ToolCall,
   ToolApprovalDecision,
+  ToolApprovalDetails,
   ToolApprovalHandler,
   ToolApprovalRequest,
   ToolDefinition,
@@ -31,6 +32,8 @@ export { loadProviderConfig } from "./provider/config.js";
 export { OpenAICompatibleProvider } from "./provider/openai-compatible-provider.js";
 export { BashTool } from "./runtime/bash-tool.js";
 export type { BashResult, BashToolOptions } from "./runtime/bash-tool.js";
+export { EditTool } from "./runtime/edit-tool.js";
+export type { EditResult, EditToolOptions } from "./runtime/edit-tool.js";
 export { GrepTool } from "./runtime/grep-tool.js";
 export { ReadTool } from "./runtime/read-tool.js";
 export {

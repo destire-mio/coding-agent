@@ -298,8 +298,19 @@ export function AgentApp({
           <Text bold color="yellow">
             approval required: {pendingApproval.toolName}
           </Text>
-          <Text>command: {pendingApproval.command}</Text>
-          <Text>cwd: {pendingApproval.cwd}</Text>
+          {pendingApproval.kind === "command" ? (
+            <>
+              <Text>command: {pendingApproval.command}</Text>
+              <Text>cwd: {pendingApproval.cwd}</Text>
+            </>
+          ) : (
+            <>
+              <Text>path: {pendingApproval.path}</Text>
+              <Text>version: {pendingApproval.beforeVersion}</Text>
+              <Text>diff:</Text>
+              <Text>{pendingApproval.diff}</Text>
+            </>
+          )}
           <Text>[y] approve · [n] reject</Text>
         </Box>
       ) : null}

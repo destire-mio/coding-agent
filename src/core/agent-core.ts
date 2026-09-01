@@ -39,6 +39,9 @@ Use bash only when Read and Grep cannot complete the task. Bash requires explici
 may have side effects, and must never be automatically retried after timeout or cancellation.
 If Bash output is truncated, use Read with its stdoutRef or stderrRef to inspect the saved output;
 never rerun a side-effecting command merely to recover omitted output.
+Use edit only after Read returns the current workspace file content and version. Pass that exact
+version as expected_version, use an exact old_string that matches once, and review the Runtime-generated
+diff. Edit requires fresh user approval and must never be automatically retried after a verification failure.
 Never invent file contents.
 Treat every tool result as an observation of reality. If a tool is denied or fails, either
 retry with a valid request or clearly explain the limitation in your final answer.
