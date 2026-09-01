@@ -227,7 +227,8 @@ export type RunFailureReason =
   | "invalid_user_input"
   | "provider_error"
   | "invalid_model_response"
-  | "runtime_error";
+  | "runtime_error"
+  | "session_persist_failed";
 
 interface RunEvidence {
   readonly steps: number;

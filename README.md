@@ -108,8 +108,34 @@ terminal `operation_conflict`. Replaying an applied operation returns its stored
 success, while a rejected operation leaves a minimal `cancelled` tombstone.
 Reusing one operation identity with different arguments is always rejected.
 This is the Edit side-effect recovery primitive, not full Session recovery: the
-CLI does not yet persist and automatically resume the old model conversation.
+CLI persists the current transcript but does not yet discover and automatically
+resume an old model conversation.
 Operation-record expiry and garbage collection are also not yet implemented.
+
+The CLI now starts one private Session transcript under
+`~/.coding-agent/sessions/` by default. Each Session uses an append-only
+`transcript.jsonl`: Core records `turn_started`, one complete `tool_intent`, its
+`tool_observation`, and the terminal Turn outcome in execution order. A Tool
+Intent contains the Core-generated `operationId` and the complete successful
+assistant response needed to replay DeepSeek reasoning while that Turn remains
+unfinished. Failed stream fragments are displayed by the TUI but are never
+committed. Final-answer reasoning is not written to the transcript or long-term
+Memory.
+
+Every JSONL record must end with a newline and be synced before it is considered
+committed. On open, an incomplete tail is truncated to the last newline; invalid
+JSON in an earlier committed record makes the Session fail closed. If
+`turn_started` or `tool_intent` cannot be persisted, Core does not call the
+Provider or Runtime respectively. If a tool has already returned but its
+Observation cannot be persisted, the run ends as `session_persist_failed`
+without pretending the side effect did not happen. A Turn is completed only
+after its terminal record is durable.
+
+One model response may contain either no ToolCall (a final answer) or exactly one
+ToolCall. More than one is rejected with zero tool execution. A Turn can still
+perform `Read → Edit → final` across separate model responses. This milestone
+does not yet discover or resume an old Session, build later-Turn Context, compact
+history, list multiple Sessions, or garbage-collect transcript data.
 
 Core also owns the lifecycle of one active run:
 
@@ -153,9 +179,10 @@ DeepSeek thinking mode is enabled. The Adapter converts streamed
 `reasoning_content` into provider-neutral `think` parts, Core retains the
 complete assistant message, and the Adapter replays the reasoning on later
 requests in the same run. The TUI renders reasoning separately from the final
-answer. This milestone does not persist it to disk; Session Transcript retention
-belongs to the later Session milestone, and reasoning will not enter long-term
-Memory/RAG.
+answer. Successful reasoning attached to an unfinished Tool Intent is persisted
+as private replay state; failed deltas and completed final-answer reasoning are
+not. Replay state does not automatically enter future completed-Turn Context or
+long-term Memory/RAG.
 
 The v1 Provider boundary is intentionally limited to OpenAI-compatible Chat
 Completions. It does not implement the OpenAI Responses API or Anthropic's native
@@ -224,10 +251,11 @@ terminate the run instead.
 Model-visible tool definitions come from the same Runtime registry used for
 execution. Duplicate names fail during Runtime construction, while an
 unregistered name returns a paired `unknown_tool` Observation. If one model
-response contains multiple tool calls, Core executes them sequentially in model
-order and records their Observations in the same order. The current run's
-messages form an in-memory trajectory returned in `RunResult`; persistent audit
-storage belongs to the later Session milestone.
+response contains multiple tool calls, Core rejects the complete response and
+executes none of them. Separate responses can still produce a sequential tool
+trajectory. The current run's messages form an in-memory trajectory returned in
+`RunResult`, while the private Session transcript records the durable execution
+facts needed by the later resume milestone.
 
 ## Streaming boundary
 
@@ -304,7 +332,12 @@ The deterministic suite covers:
   replay without another approval or rename, both restart crash windows,
   recovery re-approval, conflict detection, cancelled tombstones, and
   same-ID/different-arguments rejection;
-- multiple tool calls executing sequentially in model order;
+- multiple tool calls in one model response being rejected with zero execution;
+- private Session JSONL ordering, `0600` files, incomplete-tail truncation,
+  committed-record corruption failure, and workspace/private-store separation;
+- Tool Intent durability before Runtime, Observation durability after Runtime,
+  final-outcome durability, and injected persistence failures on both sides of
+  an applied Edit;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
 - streamed thinking, text, and fragmented tool arguments being assembled
@@ -366,17 +399,21 @@ exponential backoff with jitter, `Retry-After`, and cancellation-aware waiting.
 There are deliberate simplifications and deviations. Kimi's Core defaults to
 10 attempts and its OpenAI client retains SDK retries; this milestone uses 3
 Core-visible attempts and disables SDK retries so its attempt count is directly
-explainable and testable. It also does not yet persist interrupted turns or
-write a synthetic unexecuted tool result; those belong to later Session and
-recovery milestones.
+explainable and testable. The current transcript records interrupted terminal
+states and durable Tool Intents, but it does not yet auto-resume them or write a
+synthetic unexecuted tool result; those belong to the later recovery milestone.
 
 The Thinking round-trip was separately checked against Kimi Code at pinned
 commit
 [`619564d`](https://github.com/MoonshotAI/kimi-code/tree/619564dcf9ee10a3cfbf7ecbc764c6b9b63fc91b).
 This project adopts its provider-neutral `think` content, separate thinking
 stream, and Adapter-owned conversion back to DeepSeek's reasoning field.
-Unlike Kimi's Transcript layer, this milestone retains reasoning only in the
-current run and TUI; disk persistence waits for the Session milestone.
+Kimi persists a complete per-Agent Wire event stream for Session replay. This
+project now adopts the smaller append-only fact-log principle, but keeps only one
+Session transcript, one ToolCall per response, and no Session index, metadata
+snapshot, multi-Agent layout, automatic resume, or Context read model. Complete
+reasoning is durable only as private recovery payload for an unfinished Tool
+Intent and is excluded from completed final-answer records.
 
 The Agent cancellation design was checked at the same pinned commit against
 Kimi's stateful Agent/TurnFlow lifecycle, stateless loop `AbortSignal`, and Esc
@@ -418,8 +455,8 @@ Kimi's v2
 is per-turn loop protection: same-step duplicates share one result, while
 cross-step repeats receive reminders. Its state is not the durable Edit outcome
 journal needed for a process crash. This project therefore keeps a small
-Runtime-owned Edit record instead of importing Kimi's complete Session/Wire
-persistence layer before the Session milestone.
+Runtime-owned Edit record and a separate minimal Session transcript instead of
+importing Kimi's complete Session/Wire stack.
 
 ## Current security boundary
 
@@ -447,8 +484,10 @@ persistence layer before the Session milestone.
   boundary. Grep filtering does not prevent an explicit Read of a sensitive
   workspace file under the current Read policy.
 - Model reasoning may repeat sensitive material from the prompt or Observation.
-  It is displayed in the TUI and retained in the current in-memory `RunResult`,
-  but is not written to the workspace, Git, long-term Memory, or telemetry.
+  It is displayed in the TUI and retained in the current in-memory `RunResult`.
+  Successful reasoning needed to resume an unfinished Tool Intent is also stored
+  in the private `0600` Session transcript, but it is not written to the
+  workspace, Git, long-term Memory, or telemetry.
 - Application-level path checks are not an OS sandbox and do not yet defend every
   concurrent filesystem race. Stronger sandboxing is a later milestone.
 - Bash receives a small environment allowlist, runs in a separate POSIX process
@@ -456,13 +495,13 @@ persistence layer before the Session milestone.
   leftovers. It may still access files, processes, or networks available to the
   current user and may leave side effects before timeout or cancellation; this
   is not an OS sandbox and an unknown outcome is never automatically retried.
-- Arbitrary overwrite, multi-file Edit, MCP, plugins, long-term Session/Memory,
-  multi-agent behavior, background task management, and a complex TUI are
-  intentionally absent.
+- Arbitrary overwrite, multi-file Edit, MCP, plugins, automatic multi-Turn
+  Session resume, long-term Memory, multi-agent behavior, background task
+  management, and a complex TUI are intentionally absent.
 
 ## Status
 
-On 2026-09-01, the deterministic suite passed 116 tests across 16 test files. The
+On 2026-09-01, the deterministic suite passed 126 tests across 17 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -471,7 +510,9 @@ beside the original ToolCall and Read Observation on the next request. Retrying
 the second model request preserves the existing Observation and executes Read
 only once. Tool Runtime contract tests lock same-registry disclosure, duplicate
 registration rejection, paired unknown-tool and malformed-argument failures,
-and sequential multi-call scheduling. A deterministic Ink TUI trajectory also
+and one-ToolCall-per-response enforcement. Session tests lock JSONL commit and
+tail-repair rules, Core write-ahead ordering, final outcome durability, and the
+two persistence-failure sides of a real Edit. A deterministic Ink TUI trajectory also
 proves that Esc reaches the Core state machine, aborts the Provider signal, and
 ends as `stopped: cancelled`. A separate in-flight Read test proves that its
 completed Observation is retained while the next model request is suppressed.
@@ -506,10 +547,10 @@ The compiled TUI also completed a real `package.json` Read,
 retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.
 
-This proves the current minimum chain and deterministic Edit side-effect
-recovery primitive run. It does not yet prove automatic Session/Turn resumption,
-power-loss durability, a hostile-workspace sandbox, or the later complete
-production milestone.
+This proves the current minimum chain, deterministic Edit side-effect recovery,
+and durable Session write-ahead ordering. It does not yet prove automatic
+Session/Turn resumption, later-Turn Context projection, power-loss durability, a
+hostile-workspace sandbox, or the later complete production milestone.
 
 ## License
 

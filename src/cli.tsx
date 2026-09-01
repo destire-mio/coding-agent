@@ -14,6 +14,11 @@ import {
 import { WorkspaceConfigurationError } from "./runtime/read-tool.js";
 import { ToolRuntime } from "./runtime/tool-runtime.js";
 import { ToolOutputStoreConfigurationError } from "./runtime/tool-output-store.js";
+import {
+  SessionTranscriptConfigurationError,
+  SessionTranscriptError,
+  SessionTranscriptStore,
+} from "./session/session-transcript-store.js";
 import { AgentApp } from "./tui/agent-app.js";
 
 interface CliOptions {
@@ -33,14 +38,20 @@ async function main(): Promise<number> {
 
   let providerConfig;
   let runtime: ToolRuntime;
+  let session: SessionTranscriptStore;
   try {
     providerConfig = loadProviderConfig();
     runtime = await ToolRuntime.withEdit({ workspaceRoot: options.workspace });
+    session = await SessionTranscriptStore.create({
+      workspaceRoot: options.workspace,
+    });
   } catch (error) {
     if (
       error instanceof ConfigurationError ||
       error instanceof BashConfigurationError ||
       error instanceof EditOperationStoreConfigurationError ||
+      error instanceof SessionTranscriptConfigurationError ||
+      error instanceof SessionTranscriptError ||
       error instanceof ToolOutputStoreConfigurationError ||
       error instanceof WorkspaceConfigurationError
     ) {
@@ -52,7 +63,10 @@ async function main(): Promise<number> {
   }
 
   const provider = new OpenAICompatibleProvider(providerConfig);
-  const core = new AgentCore(provider, runtime, { maxSteps: options.maxSteps });
+  const core = new AgentCore(provider, runtime, {
+    maxSteps: options.maxSteps,
+    session,
+  });
   let exitCode = 1;
 
   const app = render(

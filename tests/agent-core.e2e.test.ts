@@ -149,7 +149,7 @@ describe("read-only ReAct end-to-end", () => {
     ).toHaveLength(2);
   });
 
-  it("executes multiple tool calls sequentially in model order", async () => {
+  it("rejects multiple tool calls in one model response without execution", async () => {
     const executionOrder: string[] = [];
     const runtime: ToolExecutor = {
       definitions: () => [],
@@ -182,27 +182,18 @@ describe("read-only ReAct end-to-end", () => {
           },
         ],
       },
-      {
-        kind: "final",
-        content: [{ type: "text", text: "Both reads completed." }],
-      },
     ]);
     const core = new AgentCore(provider, runtime);
 
     const result = await core.run("Read README.md and package.json");
 
-    expect(result.kind).toBe("final_answer");
-    expect(executionOrder).toEqual([
-      "start:call-first",
-      "finish:call-first",
-      "start:call-second",
-      "finish:call-second",
-    ]);
-    expect(
-      provider.requests[1]?.messages
-        .filter((message) => message.role === "tool")
-        .map((message) => message.toolCallId),
-    ).toEqual(["call-first", "call-second"]);
+    expect(result).toMatchObject({
+      kind: "failed",
+      reason: "invalid_model_response",
+      message: "The model returned multiple tool calls in one response.",
+    });
+    expect(executionOrder).toEqual([]);
+    expect(provider.requests).toHaveLength(1);
   });
 
   it("feeds a denied Read back to the model as an error Observation", async () => {

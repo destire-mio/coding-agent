@@ -65,3 +65,15 @@ export type {
   BashRuntimeOptions,
   EditRuntimeOptions,
 } from "./runtime/tool-runtime.js";
+export {
+  SessionTranscriptConfigurationError,
+  SessionTranscriptCorruptError,
+  SessionTranscriptError,
+  SessionTranscriptStore,
+} from "./session/session-transcript-store.js";
+export type {
+  SessionEvent,
+  SessionEventInput,
+  SessionEventWriter,
+  SessionTranscriptStoreOptions,
+} from "./session/session-transcript-store.js";

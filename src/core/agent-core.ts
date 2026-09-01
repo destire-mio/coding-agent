@@ -34,6 +34,10 @@ import {
   type ProviderRetryOptions,
   type ProviderRetryPolicy,
 } from "./provider-retry.js";
+import type {
+  SessionEventInput,
+  SessionEventWriter,
+} from "../session/session-transcript-store.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a coding agent operating inside one workspace.
 Use grep to locate unknown content or file locations, and read when a concrete path is known.
@@ -47,12 +51,14 @@ diff. Edit requires fresh user approval and must never be automatically retried 
 Never invent file contents.
 Treat every tool result as an observation of reality. If a tool is denied or fails, either
 retry with a valid request or clearly explain the limitation in your final answer.
+Call at most one tool in each model response. Use the next model response for another tool.
 When you have enough evidence, return a concise final answer without a tool call.`;
 
 export interface AgentCoreOptions {
   readonly maxSteps?: number;
   readonly systemPrompt?: string;
   readonly providerRetry?: ProviderRetryOptions;
+  readonly session?: SessionEventWriter;
 }
 
 export interface RunOptions {
@@ -67,6 +73,7 @@ export class AgentCore {
   readonly #maxSteps: number;
   readonly #systemPrompt: string;
   readonly #providerRetry: ProviderRetryPolicy;
+  readonly #session: SessionEventWriter | undefined;
   #runState: AgentRunState = INITIAL_AGENT_RUN_STATE;
   #activeController: AbortController | undefined;
 
@@ -85,6 +92,7 @@ export class AgentCore {
     this.#maxSteps = maxSteps;
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#providerRetry = resolveProviderRetryPolicy(options.providerRetry);
+    this.#session = options.session;
   }
 
   get state(): AgentRunState {
@@ -113,16 +121,18 @@ export class AgentCore {
     const messages: AgentMessage[] = [];
 
     if (prompt.length === 0) {
-      return this.#failed(
+      const result = this.#failed(
         0,
         messages,
         "invalid_user_input",
         "The user input must not be empty.",
-        options.onEvent,
       );
+      this.#emitTerminal(options.onEvent, result);
+      return result;
     }
 
     const controller = new AbortController();
+    const turnId = randomUUID();
     this.#transition({ type: "start" });
     this.#activeController = controller;
 
@@ -136,13 +146,15 @@ export class AgentCore {
     }
 
     try {
-      const result = await this.#runLoop(prompt, {
+      let result = await this.#runLoop(prompt, turnId, {
         signal: controller.signal,
         ...(options.onEvent === undefined ? {} : { onEvent: options.onEvent }),
         ...(options.requestApproval === undefined
           ? {}
           : { requestApproval: options.requestApproval }),
       });
+      result = await this.#persistTurnOutcome(turnId, result);
+      this.#emitTerminal(options.onEvent, result);
       this.#transition({ type: "settle", outcome: runOutcome(result) });
       return result;
     } catch (error) {
@@ -156,14 +168,27 @@ export class AgentCore {
     }
   }
 
-  async #runLoop(prompt: string, options: RunOptions): Promise<RunResult> {
+  async #runLoop(
+    prompt: string,
+    turnId: string,
+    options: RunOptions,
+  ): Promise<RunResult> {
     const messages: AgentMessage[] = [];
     messages.push({ role: "user", content: prompt });
+    if (
+      !(await this.#persistSessionEvent({
+        type: "turn_started",
+        turnId,
+        userInput: prompt,
+      }))
+    ) {
+      return this.#sessionFailure(0, messages);
+    }
     const seenToolCallIds = new Set<string>();
 
     for (let step = 1; step <= this.#maxSteps; step += 1) {
       if (isSignalAborted(options.signal)) {
-        return this.#stopped(step - 1, messages, "cancelled", options.onEvent);
+        return this.#stopped(step - 1, messages, "cancelled");
       }
       this.#transition({ type: "request_model", step });
       const completion = await this.#completeModel(
@@ -181,7 +206,7 @@ export class AgentCore {
       }
       const response = completion.response;
       if (isSignalAborted(options.signal)) {
-        return this.#stopped(step, messages, "cancelled", options.onEvent);
+        return this.#stopped(step, messages, "cancelled");
       }
 
       if (response.kind === "final") {
@@ -192,7 +217,6 @@ export class AgentCore {
             messages,
             "invalid_model_response",
             "The model returned neither tool calls nor a final answer.",
-            options.onEvent,
           );
         }
 
@@ -201,7 +225,6 @@ export class AgentCore {
           content: [...response.content],
           toolCalls: [],
         });
-        this.#emit(options.onEvent, { type: "final_answer", step, answer });
         return { kind: "final_answer", answer, steps: step, messages: [...messages] };
       }
 
@@ -211,106 +234,128 @@ export class AgentCore {
           messages,
           "invalid_model_response",
           "The model returned an empty tool call list.",
-          options.onEvent,
         );
       }
 
-      const invalidCall = response.calls.find(
-        (call) =>
-          call.id.trim().length === 0 ||
-          call.name.trim().length === 0 ||
-          seenToolCallIds.has(call.id),
-      );
-      if (invalidCall !== undefined) {
+      if (response.calls.length > 1) {
+        return this.#failed(
+          step,
+          messages,
+          "invalid_model_response",
+          "The model returned multiple tool calls in one response.",
+        );
+      }
+
+      const call = response.calls[0];
+      if (
+        call === undefined ||
+        call.id.trim().length === 0 ||
+        call.name.trim().length === 0 ||
+        seenToolCallIds.has(call.id)
+      ) {
         return this.#failed(
           step,
           messages,
           "invalid_model_response",
           "The model returned a missing or duplicate tool call identity.",
-          options.onEvent,
         );
+      }
+
+      if (isSignalAborted(options.signal)) {
+        return this.#stopped(step, messages, "cancelled");
+      }
+
+      const operationId = randomUUID();
+      if (
+        !(await this.#persistSessionEvent({
+          type: "tool_intent",
+          turnId,
+          step,
+          operationId,
+          call,
+          replayContent: [...response.content],
+        }))
+      ) {
+        return this.#sessionFailure(step, messages);
       }
 
       messages.push({
         role: "assistant",
         content: response.content,
-        toolCalls: [...response.calls],
+        toolCalls: [call],
       });
+      seenToolCallIds.add(call.id);
+      this.#transition({
+        type: "execute_tool",
+        step,
+        toolCallId: call.id,
+        toolName: call.name,
+      });
+      this.#emit(options.onEvent, {
+        type: "tool_call",
+        step,
+        operationId,
+        call,
+      });
+      if (isSignalAborted(options.signal)) {
+        return this.#stopped(step, messages, "cancelled");
+      }
 
-      for (const call of response.calls) {
-        if (isSignalAborted(options.signal)) {
-          return this.#stopped(step, messages, "cancelled", options.onEvent);
-        }
-        seenToolCallIds.add(call.id);
-        const operationId = randomUUID();
-        this.#transition({
-          type: "execute_tool",
-          step,
-          toolCallId: call.id,
-          toolName: call.name,
+      let observation: Observation;
+      try {
+        observation = await this.#runtime.execute(call, {
+          operationId,
+          ...(options.signal === undefined ? {} : { signal: options.signal }),
+          ...(options.requestApproval === undefined
+            ? {}
+            : { requestApproval: options.requestApproval }),
         });
-        this.#emit(options.onEvent, {
-          type: "tool_call",
+      } catch {
+        if (isSignalAborted(options.signal)) {
+          return this.#stopped(step, messages, "cancelled");
+        }
+        return this.#failed(
+          step,
+          messages,
+          "runtime_error",
+          "The tool runtime failed before it could return an observation.",
+        );
+      }
+
+      if (observation.toolCallId !== call.id) {
+        return this.#failed(
+          step,
+          messages,
+          "runtime_error",
+          "The tool runtime returned an observation for the wrong tool call.",
+        );
+      }
+
+      messages.push({
+        role: "tool",
+        operationId,
+        toolCallId: call.id,
+        toolName: call.name,
+        observation,
+      });
+      this.#emit(options.onEvent, { type: "observation", step, observation });
+      if (
+        !(await this.#persistSessionEvent({
+          type: "tool_observation",
+          turnId,
           step,
           operationId,
-          call,
-        });
-        if (isSignalAborted(options.signal)) {
-          return this.#stopped(step, messages, "cancelled", options.onEvent);
-        }
-
-        let observation: Observation;
-        try {
-          observation = await this.#runtime.execute(call, {
-            operationId,
-            ...(options.signal === undefined ? {} : { signal: options.signal }),
-            ...(options.requestApproval === undefined
-              ? {}
-              : { requestApproval: options.requestApproval }),
-          });
-        } catch {
-          if (isSignalAborted(options.signal)) {
-            return this.#stopped(step, messages, "cancelled", options.onEvent);
-          }
-          return this.#failed(
-            step,
-            messages,
-            "runtime_error",
-            "The tool runtime failed before it could return an observation.",
-            options.onEvent,
-          );
-        }
-
-        if (observation.toolCallId !== call.id) {
-          return this.#failed(
-            step,
-            messages,
-            "runtime_error",
-            "The tool runtime returned an observation for the wrong tool call.",
-            options.onEvent,
-          );
-        }
-
-        messages.push({
-          role: "tool",
-          operationId,
-          toolCallId: call.id,
-          toolName: call.name,
           observation,
-        });
-        this.#emit(options.onEvent, { type: "observation", step, observation });
-        if (isSignalAborted(options.signal)) {
-          return this.#stopped(step, messages, "cancelled", options.onEvent);
-        }
+        }))
+      ) {
+        return this.#sessionFailure(step, messages);
+      }
+      if (isSignalAborted(options.signal)) {
+        return this.#stopped(step, messages, "cancelled");
       }
     }
 
-    return this.#stopped(
-      this.#maxSteps,
-      messages,
-      "max_steps",
-      options.onEvent,
-    );
+    return this.#stopped(this.#maxSteps, messages, "max_steps");
   }
 
   async #completeModel(
@@ -322,7 +367,7 @@ export class AgentCore {
     if (options.signal?.aborted === true) {
       return {
         kind: "terminal",
-        result: this.#stopped(step - 1, messages, "cancelled", options.onEvent),
+        result: this.#stopped(step - 1, messages, "cancelled"),
       };
     }
 
@@ -355,7 +400,7 @@ export class AgentCore {
         if (providerError.kind === "cancelled") {
           return {
             kind: "terminal",
-            result: this.#stopped(step, messages, "cancelled", options.onEvent),
+            result: this.#stopped(step, messages, "cancelled"),
           };
         }
 
@@ -370,7 +415,6 @@ export class AgentCore {
               messages,
               "provider_error",
               `The model provider request failed (${providerError.kind}).`,
-              options.onEvent,
               toProviderFailure(providerError, attempt),
             ),
           };
@@ -398,7 +442,7 @@ export class AgentCore {
           if (waitError.kind === "cancelled") {
             return {
               kind: "terminal",
-              result: this.#stopped(step, messages, "cancelled", options.onEvent),
+              result: this.#stopped(step, messages, "cancelled"),
             };
           }
           return {
@@ -408,7 +452,6 @@ export class AgentCore {
               messages,
               "provider_error",
               `The provider retry wait failed (${waitError.kind}).`,
-              options.onEvent,
               toProviderFailure(waitError, attempt),
             ),
           };
@@ -464,12 +507,10 @@ export class AgentCore {
     steps: number,
     messages: readonly AgentMessage[],
     reason: "max_steps" | "cancelled",
-    onEvent: RunOptions["onEvent"],
   ): RunResult {
     if (reason === "cancelled" && isAgentRunActive(this.#runState)) {
       this.#transition({ type: "cancel" });
     }
-    this.#emit(onEvent, { type: "stopped", steps, reason });
     return { kind: "stopped", reason, steps, messages: [...messages] };
   }
 
@@ -478,16 +519,8 @@ export class AgentCore {
     messages: readonly AgentMessage[],
     reason: RunFailureReason,
     message: string,
-    onEvent: RunOptions["onEvent"],
     providerFailure?: ProviderFailure,
   ): RunResult {
-    this.#emit(onEvent, {
-      type: "failed",
-      steps,
-      reason,
-      message,
-      ...(providerFailure === undefined ? {} : { providerFailure }),
-    });
     return {
       kind: "failed",
       reason,
@@ -496,6 +529,101 @@ export class AgentCore {
       messages: [...messages],
       ...(providerFailure === undefined ? {} : { providerFailure }),
     };
+  }
+
+  #sessionFailure(
+    steps: number,
+    messages: readonly AgentMessage[],
+  ): RunResult {
+    return this.#failed(
+      steps,
+      messages,
+      "session_persist_failed",
+      "The Agent could not persist required Session state. Any completed tool side effect remains associated with its operation ID.",
+    );
+  }
+
+  async #persistSessionEvent(event: SessionEventInput): Promise<boolean> {
+    if (this.#session === undefined) {
+      return true;
+    }
+    try {
+      await this.#session.append(event);
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  async #persistTurnOutcome(
+    turnId: string,
+    result: RunResult,
+  ): Promise<RunResult> {
+    if (
+      result.kind === "failed" &&
+      result.reason === "session_persist_failed"
+    ) {
+      return result;
+    }
+
+    const event: SessionEventInput =
+      result.kind === "final_answer"
+        ? {
+            type: "turn_finished",
+            turnId,
+            steps: result.steps,
+            outcome: "completed",
+            answer: result.answer,
+          }
+        : result.kind === "stopped"
+          ? {
+              type: "turn_finished",
+              turnId,
+              steps: result.steps,
+              outcome: result.reason,
+              reason: result.reason,
+            }
+          : {
+              type: "turn_finished",
+              turnId,
+              steps: result.steps,
+              outcome: "failed",
+              reason: result.reason,
+              message: result.message,
+            };
+
+    if (await this.#persistSessionEvent(event)) {
+      return result;
+    }
+    return this.#sessionFailure(result.steps, result.messages);
+  }
+
+  #emitTerminal(onEvent: RunOptions["onEvent"], result: RunResult): void {
+    if (result.kind === "final_answer") {
+      this.#emit(onEvent, {
+        type: "final_answer",
+        step: result.steps,
+        answer: result.answer,
+      });
+      return;
+    }
+    if (result.kind === "stopped") {
+      this.#emit(onEvent, {
+        type: "stopped",
+        steps: result.steps,
+        reason: result.reason,
+      });
+      return;
+    }
+    this.#emit(onEvent, {
+      type: "failed",
+      steps: result.steps,
+      reason: result.reason,
+      message: result.message,
+      ...(result.providerFailure === undefined
+        ? {}
+        : { providerFailure: result.providerFailure }),
+    });
   }
 
   #emit(onEvent: RunOptions["onEvent"], event: RunEvent): void {
