@@ -35,6 +35,11 @@ export type AwaitingModelResumeState = Extract<
   { readonly kind: "awaiting_model" }
 >;
 
+export type ResumableSessionState = Extract<
+  SessionResumeState,
+  { readonly kind: "awaiting_model" | "recovering_tool" }
+>;
+
 interface ActiveTurn {
   readonly turnId: string;
   readonly messages: AgentMessage[];

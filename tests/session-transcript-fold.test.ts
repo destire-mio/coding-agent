@@ -1,4 +1,11 @@
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import {
+  mkdir,
+  mkdtemp,
+  readFile,
+  rm,
+  stat,
+  writeFile,
+} from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -7,8 +14,11 @@ import { AgentCore } from "../src/core/agent-core.js";
 import type {
   ModelProvider,
   ModelRequest,
+  Observation,
+  ToolCall,
   ToolExecutor,
 } from "../src/core/contracts.js";
+import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import { foldSessionTranscript } from "../src/session/session-transcript-fold.js";
 import {
   SessionTranscriptCorruptError,
@@ -228,16 +238,285 @@ describe("Core awaiting-model resume", () => {
   });
 });
 
+describe("Core recovering-tool resume", () => {
+  it("reruns a pending Read with its original operation identity", async () => {
+    const harness = await createStoreHarness("resume-read");
+    await writeFile(
+      join(harness.workspace, "README.md"),
+      "# Recovery\n\nREAD_RECOVERY_MARKER\n",
+      "utf8",
+    );
+    await appendTurnStart(harness.store, "turn-read");
+    await harness.store.append(intent("turn-read"));
+    const state = foldSessionTranscript(await harness.store.load());
+    if (state.kind !== "recovering_tool") {
+      throw new Error("Expected a recovering-tool state.");
+    }
+
+    const realRuntime = await ToolRuntime.readOnly({
+      workspaceRoot: harness.workspace,
+    });
+    const executions: Array<{ call: ToolCall; operationId?: string }> = [];
+    const runtime: ToolExecutor = {
+      definitions: () => realRuntime.definitions(),
+      execute: async (call, options) => {
+        executions.push({
+          call,
+          ...(options?.operationId === undefined
+            ? {}
+            : { operationId: options.operationId }),
+        });
+        return realRuntime.execute(call, options);
+      },
+    };
+    const requests: ModelRequest[] = [];
+    const provider: ModelProvider = {
+      complete: async (request) => {
+        requests.push(request);
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "Recovered README summary" }],
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      session: harness.store,
+      maxSteps: 4,
+    });
+
+    const result = await core.resume(state);
+
+    expect(result).toMatchObject({
+      kind: "final_answer",
+      answer: "Recovered README summary",
+      steps: 2,
+    });
+    expect(executions).toEqual([
+      {
+        call: state.intent.call,
+        operationId: "operation-read",
+      },
+    ]);
+    expect(JSON.stringify(requests[0]?.messages)).toContain(
+      "READ_RECOVERY_MARKER",
+    );
+    expect((await harness.store.load()).map((event) => event.type)).toEqual([
+      "session_started",
+      "turn_started",
+      "tool_intent",
+      "tool_observation",
+      "turn_finished",
+    ]);
+  });
+
+  it("reruns a pending Grep and gives its new Observation to the model", async () => {
+    const harness = await createStoreHarness("resume-grep");
+    await writeFile(
+      join(harness.workspace, "app.log"),
+      "INFO ready\nERROR GREP_RECOVERY_MARKER\n",
+      "utf8",
+    );
+    await appendTurnStart(harness.store, "turn-grep");
+    const call: ToolCall = {
+      id: "call-grep",
+      name: "grep",
+      rawArguments: JSON.stringify({ pattern: "^ERROR", path: "app.log" }),
+    };
+    await harness.store.append(
+      toolIntent("turn-grep", "operation-grep", call),
+    );
+    const state = foldSessionTranscript(await harness.store.load());
+    if (state.kind !== "recovering_tool") {
+      throw new Error("Expected a recovering-tool state.");
+    }
+    const runtime = await ToolRuntime.readOnly({
+      workspaceRoot: harness.workspace,
+    });
+    const requests: ModelRequest[] = [];
+    const provider: ModelProvider = {
+      complete: async (request) => {
+        requests.push(request);
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "Recovered Grep result" }],
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      session: harness.store,
+      maxSteps: 4,
+    });
+
+    const result = await core.resume(state);
+
+    expect(result.kind).toBe("final_answer");
+    expect(JSON.stringify(requests[0]?.messages)).toContain(
+      "GREP_RECOVERY_MARKER",
+    );
+  });
+
+  it("uses the Edit journal instead of writing an applied operation again", async () => {
+    const harness = await createStoreHarness("resume-edit");
+    const path = join(harness.workspace, "config.ts");
+    await writeFile(path, "export const timeout = 30;\n", "utf8");
+    const runtimeOptions = {
+      workspaceRoot: harness.workspace,
+      editOperationRoot: join(harness.root, "edit-operations"),
+      toolOutputRoot: join(harness.root, "tool-output"),
+    };
+    const firstRuntime = await ToolRuntime.withEdit(runtimeOptions);
+    const version = readVersion(
+      await firstRuntime.execute({
+        id: "call-version",
+        name: "read",
+        rawArguments: JSON.stringify({ path: "config.ts" }),
+      }),
+    );
+    const call: ToolCall = {
+      id: "call-edit",
+      name: "edit",
+      rawArguments: JSON.stringify({
+        path: "config.ts",
+        old_string: "timeout = 30",
+        new_string: "timeout = 60",
+        expected_version: version,
+      }),
+    };
+    const operationId = "operation-edit-recovery";
+    await appendTurnStart(harness.store, "turn-edit");
+    await harness.store.append(toolIntent("turn-edit", operationId, call));
+    const applied = await firstRuntime.execute(call, {
+      operationId,
+      requestApproval: async () => "approved",
+    });
+    expect(applied.status).toBe("success");
+    const appliedInode = (await stat(path, { bigint: true })).ino;
+
+    const state = foldSessionTranscript(await harness.store.load());
+    if (state.kind !== "recovering_tool") {
+      throw new Error("Expected a recovering-tool state.");
+    }
+    const restartedRuntime = await ToolRuntime.withEdit(runtimeOptions);
+    let approvals = 0;
+    const provider: ModelProvider = {
+      complete: async () => ({
+        kind: "final",
+        content: [{ type: "text", text: "Edit recovery confirmed" }],
+      }),
+    };
+    const core = new AgentCore(provider, restartedRuntime, {
+      session: harness.store,
+      maxSteps: 4,
+    });
+
+    const result = await core.resume(state, {
+      requestApproval: async () => {
+        approvals += 1;
+        return "approved";
+      },
+    });
+
+    expect(result).toMatchObject({
+      kind: "final_answer",
+      answer: "Edit recovery confirmed",
+    });
+    expect(approvals).toBe(0);
+    await expect(readFile(path, "utf8")).resolves.toBe(
+      "export const timeout = 60;\n",
+    );
+    expect((await stat(path, { bigint: true })).ino).toBe(appliedInode);
+  });
+
+  it("turns an unfinished Bash into unknown outcome without executing it", async () => {
+    const store = await createStore("resume-bash");
+    await appendTurnStart(store, "turn-bash");
+    const call: ToolCall = {
+      id: "call-bash",
+      name: "bash",
+      rawArguments: JSON.stringify({ command: "touch SHOULD_NOT_EXIST" }),
+    };
+    await store.append(toolIntent("turn-bash", "operation-bash", call));
+    const state = foldSessionTranscript(await store.load());
+    if (state.kind !== "recovering_tool") {
+      throw new Error("Expected a recovering-tool state.");
+    }
+
+    let runtimeCalls = 0;
+    let approvalCalls = 0;
+    const requests: ModelRequest[] = [];
+    const runtime: ToolExecutor = {
+      definitions: () => [],
+      execute: async () => {
+        runtimeCalls += 1;
+        throw new Error("Bash must not be executed during recovery.");
+      },
+    };
+    const provider: ModelProvider = {
+      complete: async (request) => {
+        requests.push(request);
+        return {
+          kind: "final",
+          content: [{ type: "text", text: "Bash outcome is unknown" }],
+        };
+      },
+    };
+    const core = new AgentCore(provider, runtime, {
+      session: store,
+      maxSteps: 4,
+    });
+
+    const result = await core.resume(state, {
+      requestApproval: async () => {
+        approvalCalls += 1;
+        return "approved";
+      },
+    });
+
+    expect(result.kind).toBe("final_answer");
+    expect(runtimeCalls).toBe(0);
+    expect(approvalCalls).toBe(0);
+    const recoveredObservation = requests[0]?.messages.at(-1);
+    expect(recoveredObservation).toMatchObject({
+      role: "tool",
+      operationId: "operation-bash",
+      observation: {
+        status: "error",
+        error: {
+          code: "recovery_unknown_outcome",
+          retryable: false,
+          details: {
+            operationId: "operation-bash",
+            outcome: "unknown",
+            executedAgain: false,
+          },
+        },
+      },
+    });
+    expect((await store.load()).map((event) => event.type)).toEqual([
+      "session_started",
+      "turn_started",
+      "tool_intent",
+      "tool_observation",
+      "turn_finished",
+    ]);
+  });
+});
+
 async function createStore(sessionId: string): Promise<SessionTranscriptStore> {
+  return (await createStoreHarness(sessionId)).store;
+}
+
+async function createStoreHarness(sessionId: string) {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-session-fold-"));
   temporaryRoots.push(root);
   const workspace = join(root, "workspace");
   await mkdir(workspace);
-  return SessionTranscriptStore.create({
+  const store = await SessionTranscriptStore.create({
     workspaceRoot: workspace,
     root: join(root, "sessions"),
     sessionId,
   });
+  return { root, workspace, store };
 }
 
 async function appendTurnStart(
@@ -252,16 +531,24 @@ async function appendTurnStart(
 }
 
 function intent(turnId: string): SessionEventInput {
+  return toolIntent(turnId, "operation-read", {
+    id: "call-read",
+    name: "read",
+    rawArguments: JSON.stringify({ path: "README.md" }),
+  });
+}
+
+function toolIntent(
+  turnId: string,
+  operationId: string,
+  call: ToolCall,
+): Extract<SessionEventInput, { type: "tool_intent" }> {
   return {
     type: "tool_intent",
     turnId,
     step: 1,
-    operationId: "operation-read",
-    call: {
-      id: "call-read",
-      name: "read",
-      rawArguments: JSON.stringify({ path: "README.md" }),
-    },
+    operationId,
+    call,
     replayContent: [{ type: "think", think: "I need the file." }],
   };
 }
@@ -281,4 +568,18 @@ function observation(
       output: { content: "# README" },
     },
   };
+}
+
+function readVersion(observation: Observation): string {
+  if (observation.status !== "success") {
+    throw new Error("Expected Read to return a version.");
+  }
+  if (typeof observation.output !== "object" || observation.output === null) {
+    throw new Error("Expected structured Read output.");
+  }
+  const version = (observation.output as Record<string, unknown>)["version"];
+  if (typeof version !== "string") {
+    throw new Error("Expected Read to return a version.");
+  }
+  return version;
 }

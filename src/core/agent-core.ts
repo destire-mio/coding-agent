@@ -39,7 +39,7 @@ import type {
   SessionEventWriter,
 } from "../session/session-transcript-store.js";
 import type {
-  AwaitingModelResumeState,
+  ResumableSessionState,
 } from "../session/session-transcript-fold.js";
 
 const DEFAULT_SYSTEM_PROMPT = `You are a coding agent operating inside one workspace.
@@ -56,6 +56,8 @@ Treat every tool result as an observation of reality. If a tool is denied or fai
 retry with a valid request or clearly explain the limitation in your final answer.
 Call at most one tool in each model response. Use the next model response for another tool.
 When you have enough evidence, return a concise final answer without a tool call.`;
+
+const RECOVERABLE_TOOL_NAMES = new Set(["read", "grep", "edit"]);
 
 export interface AgentCoreOptions {
   readonly maxSteps?: number;
@@ -139,7 +141,7 @@ export class AgentCore {
   }
 
   async resume(
-    state: AwaitingModelResumeState,
+    state: ResumableSessionState,
     options: RunOptions = {},
   ): Promise<RunResult> {
     this.#requireNoActiveRun();
@@ -153,6 +155,29 @@ export class AgentCore {
     }
 
     const messages = [...state.messages];
+    if (state.kind === "recovering_tool") {
+      return this.#executeTurn(state.turnId, options, async (activeOptions) => {
+        const toolStep = await this.#completeToolStep(
+          messages,
+          state.turnId,
+          state.step,
+          state.intent.operationId,
+          state.intent.call,
+          activeOptions,
+          "recovery",
+        );
+        if (toolStep.kind === "terminal") {
+          return toolStep.result;
+        }
+        return this.#continueLoop(
+          messages,
+          state.turnId,
+          state.step + 1,
+          collectToolCallIds(messages),
+          activeOptions,
+        );
+      });
+    }
     return this.#executeTurn(state.turnId, options, (activeOptions) =>
       this.#continueLoop(
         messages,
@@ -336,23 +361,55 @@ export class AgentCore {
         toolCalls: [call],
       });
       seenToolCallIds.add(call.id);
-      this.#transition({
-        type: "execute_tool",
-        step,
-        toolCallId: call.id,
-        toolName: call.name,
-      });
-      this.#emit(options.onEvent, {
-        type: "tool_call",
+      const toolStep = await this.#completeToolStep(
+        messages,
+        turnId,
         step,
         operationId,
         call,
-      });
-      if (isSignalAborted(options.signal)) {
-        return this.#stopped(step, messages, "cancelled");
+        options,
+        "normal",
+      );
+      if (toolStep.kind === "terminal") {
+        return toolStep.result;
       }
+    }
 
-      let observation: Observation;
+    return this.#stopped(this.#maxSteps, messages, "max_steps");
+  }
+
+  async #completeToolStep(
+    messages: AgentMessage[],
+    turnId: string,
+    step: number,
+    operationId: string,
+    call: ToolCall,
+    options: RunOptions,
+    mode: "normal" | "recovery",
+  ): Promise<ToolStepOutcome> {
+    this.#transition({
+      type: "execute_tool",
+      step,
+      toolCallId: call.id,
+      toolName: call.name,
+    });
+    this.#emit(options.onEvent, {
+      type: "tool_call",
+      step,
+      operationId,
+      call,
+    });
+    if (isSignalAborted(options.signal)) {
+      return {
+        kind: "terminal",
+        result: this.#stopped(step, messages, "cancelled"),
+      };
+    }
+
+    let observation: Observation;
+    if (mode === "recovery" && !RECOVERABLE_TOOL_NAMES.has(call.name)) {
+      observation = recoveryUnknownOutcome(call, operationId);
+    } else {
       try {
         observation = await this.#runtime.execute(call, {
           operationId,
@@ -363,50 +420,64 @@ export class AgentCore {
         });
       } catch {
         if (isSignalAborted(options.signal)) {
-          return this.#stopped(step, messages, "cancelled");
+          return {
+            kind: "terminal",
+            result: this.#stopped(step, messages, "cancelled"),
+          };
         }
-        return this.#failed(
-          step,
-          messages,
-          "runtime_error",
-          "The tool runtime failed before it could return an observation.",
-        );
+        return {
+          kind: "terminal",
+          result: this.#failed(
+            step,
+            messages,
+            "runtime_error",
+            "The tool runtime failed before it could return an observation.",
+          ),
+        };
       }
+    }
 
-      if (observation.toolCallId !== call.id) {
-        return this.#failed(
+    if (observation.toolCallId !== call.id) {
+      return {
+        kind: "terminal",
+        result: this.#failed(
           step,
           messages,
           "runtime_error",
           "The tool runtime returned an observation for the wrong tool call.",
-        );
-      }
-
-      messages.push({
-        role: "tool",
-        operationId,
-        toolCallId: call.id,
-        toolName: call.name,
-        observation,
-      });
-      this.#emit(options.onEvent, { type: "observation", step, observation });
-      if (
-        !(await this.#persistSessionEvent({
-          type: "tool_observation",
-          turnId,
-          step,
-          operationId,
-          observation,
-        }))
-      ) {
-        return this.#sessionFailure(step, messages);
-      }
-      if (isSignalAborted(options.signal)) {
-        return this.#stopped(step, messages, "cancelled");
-      }
+        ),
+      };
     }
 
-    return this.#stopped(this.#maxSteps, messages, "max_steps");
+    messages.push({
+      role: "tool",
+      operationId,
+      toolCallId: call.id,
+      toolName: call.name,
+      observation,
+    });
+    this.#emit(options.onEvent, { type: "observation", step, observation });
+    if (
+      !(await this.#persistSessionEvent({
+        type: "tool_observation",
+        turnId,
+        step,
+        operationId,
+        observation,
+      }))
+    ) {
+      return {
+        kind: "terminal",
+        result: this.#sessionFailure(step, messages),
+      };
+    }
+    if (isSignalAborted(options.signal)) {
+      return {
+        kind: "terminal",
+        result: this.#stopped(step, messages, "cancelled"),
+      };
+    }
+    return { kind: "continued" };
   }
 
   #requireNoActiveRun(): void {
@@ -704,6 +775,10 @@ type ModelCompletionOutcome =
   | { readonly kind: "response"; readonly response: ModelResponse }
   | { readonly kind: "terminal"; readonly result: RunResult };
 
+type ToolStepOutcome =
+  | { readonly kind: "continued" }
+  | { readonly kind: "terminal"; readonly result: RunResult };
+
 function isSignalAborted(signal?: AbortSignal): boolean {
   return signal?.aborted === true;
 }
@@ -716,6 +791,30 @@ function collectToolCallIds(messages: readonly AgentMessage[]): Set<string> {
         : [],
     ),
   );
+}
+
+function recoveryUnknownOutcome(
+  call: ToolCall,
+  operationId: string,
+): Observation {
+  return {
+    toolCallId: call.id,
+    toolName: call.name,
+    status: "error",
+    error: {
+      code: "recovery_unknown_outcome",
+      message:
+        `The previous ${call.name} execution may or may not have completed ` +
+        "before the Agent stopped. It was not executed again. Inspect " +
+        "workspace state with read-only tools before deciding the next action.",
+      retryable: false,
+      details: {
+        operationId,
+        outcome: "unknown",
+        executedAgain: false,
+      },
+    },
+  };
 }
 
 function runOutcome(result: RunResult) {

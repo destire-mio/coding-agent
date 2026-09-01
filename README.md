@@ -137,11 +137,15 @@ perform `Read → Edit → final` across separate model responses. This mileston
 can now fold a transcript into `no_turn`, `awaiting_model`, `recovering_tool`,
 or `finished`, and rebuild the latest unfinished Turn's paired model messages.
 Mismatched Tool Intent and Observation identities fail closed. Core can resume
-an `awaiting_model` state only when it is attached to the same Session writer;
-it sends the rebuilt messages to the Provider without replaying an already
-observed tool and durably appends the new terminal result. The CLI does not yet
-select an old Session, and Core does not yet execute `recovering_tool`, build
-later-Turn Context, compact history, list Sessions, or garbage-collect data.
+an unfinished state only when it is attached to the same Session writer. For
+`awaiting_model`, it sends the rebuilt messages to the Provider without replaying
+an observed tool. For `recovering_tool`, Read and Grep run again, Edit is
+redelivered with its original operation identity to the durable Edit journal,
+and Bash or any unclassified tool is never re-executed: Core records a
+`recovery_unknown_outcome` Observation instead. Recovery then continues the
+same loop and durably appends its terminal result. The CLI does not yet select
+an old Session, build later-Turn Context, compact history, list Sessions, or
+garbage-collect data.
 
 Core also owns the lifecycle of one active run:
 
