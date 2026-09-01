@@ -23,6 +23,24 @@ afterEach(async () => {
 });
 
 describe("Bash output refs through Read", () => {
+  it("publishes a Provider-compatible flat Read schema while Runtime enforces XOR", async () => {
+    const harness = await createHarness();
+    const readDefinition = harness.runtime.definitions().find(
+      (definition) => definition.name === "read",
+    );
+
+    expect(readDefinition?.inputSchema).toMatchObject({
+      type: "object",
+      properties: {
+        path: { type: "string" },
+        ref: { type: "string" },
+        cursor: { type: "string" },
+      },
+      additionalProperties: false,
+    });
+    expect(readDefinition?.inputSchema).not.toHaveProperty("anyOf");
+  });
+
   it("refuses to place private output storage inside the workspace", async () => {
     const root = await mkdtemp(join(tmpdir(), "coding-agent-private-boundary-"));
     temporaryRoots.push(root);

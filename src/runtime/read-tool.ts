@@ -31,12 +31,19 @@ const workspaceReadArgumentsSchema = z
     cursor: workspaceCursorSchema,
   })
   .strict();
-const toolOutputReadArgumentsSchema = z
+const readArgumentsSchema = z
   .object({
+    path: z
+      .string()
+      .trim()
+      .min(1)
+      .optional()
+      .describe("A path relative to the workspace root, for example README.md."),
     ref: z
       .string()
       .trim()
       .min(1)
+      .optional()
       .describe(
         "An exact stdoutRef or stderrRef returned by Bash. It grants access to that one private output log.",
       ),
@@ -47,14 +54,14 @@ const toolOutputReadArgumentsSchema = z
       .max(MAX_CURSOR_LENGTH)
       .optional()
       .describe(
-        "The exact nextCursor returned by a previous Read page for the same output ref. Omit to start from the beginning.",
+        "The exact nextCursor returned by a previous Read page for the same path or ref. Omit to start from the beginning.",
       ),
   })
-  .strict();
-const readArgumentsSchema = z.union([
-  workspaceReadArgumentsSchema,
-  toolOutputReadArgumentsSchema,
-]);
+  .strict()
+  .refine(
+    (input) => (input.path === undefined) !== (input.ref === undefined),
+    "exactly one of path or ref is required",
+  );
 const workspaceReadInputSchema = z.toJSONSchema(workspaceReadArgumentsSchema, {
   target: "openapi-3.0",
 });
@@ -169,7 +176,7 @@ export class ReadTool implements RuntimeTool {
     let canonicalPath: string;
     let cursorIdentity: string;
     let source: { readonly path: string } | { readonly ref: string };
-    if ("path" in parsed.data) {
+    if (parsed.data.path !== undefined) {
       const requestedPath = parsed.data.path;
       if (
         requestedPath.includes("\0") ||
@@ -221,7 +228,14 @@ export class ReadTool implements RuntimeTool {
           "This Runtime has no private tool output store.",
         );
       }
-      const location = await this.#toolOutputStore.resolve(parsed.data.ref);
+      const requestedRef = parsed.data.ref;
+      if (requestedRef === undefined) {
+        return toolError(
+          "invalid_arguments",
+          "Read expects exactly one source (path or ref).",
+        );
+      }
+      const location = await this.#toolOutputStore.resolve(requestedRef);
       if (location === undefined) {
         return toolError(
           "invalid_ref",

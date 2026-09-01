@@ -250,6 +250,9 @@ The deterministic suite covers:
 - real foreground Bash execution with fixed cwd, Provider-secret isolation,
   separate stdout/stderr, non-zero and command-not-found exits, bounded output,
   timeout/cancellation process-group termination, and background-job cleanup;
+- complete Bash stdout/stderr streaming to separate private logs, capability-ref
+  Read paging, exact reconstruction after truncation and restart, forged/cross-ref
+  rejection, and timeout/cancellation evidence recovery;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
@@ -278,6 +281,7 @@ credentials:
 ```bash
 node --env-file=.env --import tsx scripts/real-smoke.ts
 node --env-file=.env --import tsx scripts/real-grep-smoke.ts
+node --env-file=.env --import tsx scripts/real-bash-smoke.ts
 ```
 
 The Read smoke creates a temporary workspace whose marker exists only on the
@@ -288,6 +292,11 @@ the file exactly. The Grep smoke puts its safe marker on the second match and a
 forbidden marker in `.env`; it requires live pagination and verifies the
 sensitive match never reaches the model. Both smokes check thinking, tool-call,
 and text stream deltas and require the final answer to contain the safe marker.
+The Bash smoke allows exactly one predeclared, side-effect-free command in a
+temporary workspace. It requires the real model to observe truncation, page the
+private `stdoutRef` without rerunning Bash, reconstruct 33,076 bytes exactly,
+recover a marker absent from the preview, and confirm the Provider credential
+was not inherited by the child process.
 
 ## Design reference
 
@@ -334,11 +343,21 @@ bound output, and page by re-running the current search. Kimi exposes a raw
 project keeps only `pattern`, `path`, and a Runtime-signed cursor. It also treats
 timeout as a whole-call error instead of returning Kimi-style partial results.
 
+Bash output handling follows Kimi's bounded-model-result principle at pinned
+commit `619564d`: complete oversized tool output is stored outside model context
+and later read in bounded pages. This project does not expose Kimi-style private
+filesystem paths to the model; Runtime returns an unguessable single-file ref
+and authorizes it separately from workspace paths.
+
 ## Current security boundary
 
-- Only the read-only `read` and `grep` tools are registered.
-- Read accepts a relative path, canonicalizes it, and rejects paths or symlinks
-  resolving outside the workspace.
+- The local CLI registers `read`, `grep`, and foreground-only `bash`. Every Bash
+  call requires a fresh approval after Runtime validates its arguments and the
+  TUI displays the exact command and canonical workspace cwd.
+- Read accepts exactly one workspace-relative path or Runtime output ref. Paths
+  are canonicalized and paths or symlinks resolving outside the workspace are
+  rejected. Refs grant access to one private output file and cannot be used to
+  enumerate or open arbitrary paths in the private store.
 - Read accepts regular UTF-8 files and returns at most 128 KiB per call. Larger
   files continue through `nextCursor`; stale cursors fail with `file_changed`.
 - Grep executes the fixed `rg` program without a shell, accepts only relative
@@ -354,12 +373,17 @@ timeout as a whole-call error instead of returning Kimi-style partial results.
   but is not written to the workspace, Git, long-term Memory, or telemetry.
 - Application-level path checks are not an OS sandbox and do not yet defend every
   concurrent filesystem race. Stronger sandboxing is a later milestone.
-- Bash, Edit, MCP, plugins, long-term Session/Memory, multi-agent behavior, and a
-  complex TUI are intentionally absent.
+- Bash receives a small environment allowlist, runs in a separate POSIX process
+  group with timeout/cancellation cleanup, and rejects managed background
+  leftovers. It may still access files, processes, or networks available to the
+  current user and may leave side effects before timeout or cancellation; this
+  is not an OS sandbox and an unknown outcome is never automatically retried.
+- Edit, MCP, plugins, long-term Session/Memory, multi-agent behavior, background
+  task management, and a complex TUI are intentionally absent.
 
 ## Status
 
-On 2026-08-31, the deterministic suite passed 75 tests across 12 test files. The
+On 2026-09-01, the deterministic suite passed 97 tests across 15 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -375,11 +399,21 @@ completed Observation is retained while the next model request is suppressed.
 Grep tests cover real ripgrep regex execution, bounded live pagination, signed
 cursors, workspace and sensitive-file policy, long-line previews, timeout with
 partial-result discard, and Runtime cancellation of the fixed ripgrep process.
+Bash tests cover the approval gate, fixed cwd and environment, process-group
+termination, unknown outcomes, complete private stdout/stderr persistence,
+ref-based Read paging, restart reopening, and capability/path/cursor rejection.
 
-The real-provider Read and Grep smokes passed with DeepSeek Thinking. Read
+The real-provider Read, Grep, and Bash smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
 safe marker, and did not expose the `.env` marker. Both streamed reasoning,
 tool-call arguments, and final text through 3 Provider attempts with 0 retries.
+The Bash smoke completed in 4 steps and 4 Provider attempts with 0 retries:
+DeepSeek proposed the single approved command, received a truncated preview,
+used `Read(stdoutRef)` for two pages, reconstructed the complete output, and
+returned the hidden marker plus `ProviderSecret: absent` without rerunning Bash.
+This real run also caught that DeepSeek rejected a top-level `anyOf` Read schema
+with HTTP 400. The model-visible contract now uses a compatible flat object,
+while Runtime's Zod validation still enforces exactly one of `path` or `ref`.
 The compiled TUI also completed a real `package.json` Read,
 retained `step 1 thinking › ...` in the visible trajectory, and displayed
 `tool call read → observation success → final answer` before exiting normally.
