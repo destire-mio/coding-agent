@@ -134,8 +134,12 @@ after its terminal record is durable.
 One model response may contain either no ToolCall (a final answer) or exactly one
 ToolCall. More than one is rejected with zero tool execution. A Turn can still
 perform `Read → Edit → final` across separate model responses. This milestone
-does not yet discover or resume an old Session, build later-Turn Context, compact
-history, list multiple Sessions, or garbage-collect transcript data.
+can now fold a transcript into `no_turn`, `awaiting_model`, `recovering_tool`,
+or `finished`, and rebuild the latest unfinished Turn's paired model messages.
+Mismatched Tool Intent and Observation identities fail closed. The CLI does not
+yet discover or resume an old Session, execute recovery, build later-Turn
+Context, compact history, list multiple Sessions, or garbage-collect transcript
+data.
 
 Core also owns the lifecycle of one active run:
 

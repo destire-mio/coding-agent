@@ -77,3 +77,5 @@ export type {
   SessionEventWriter,
   SessionTranscriptStoreOptions,
 } from "./session/session-transcript-store.js";
+export { foldSessionTranscript } from "./session/session-transcript-fold.js";
+export type { SessionResumeState } from "./session/session-transcript-fold.js";
