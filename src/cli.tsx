@@ -10,6 +10,7 @@ import { OpenAICompatibleProvider } from "./provider/openai-compatible-provider.
 import { BashConfigurationError } from "./runtime/bash-tool.js";
 import { WorkspaceConfigurationError } from "./runtime/read-tool.js";
 import { ToolRuntime } from "./runtime/tool-runtime.js";
+import { ToolOutputStoreConfigurationError } from "./runtime/tool-output-store.js";
 import { AgentApp } from "./tui/agent-app.js";
 
 interface CliOptions {
@@ -36,6 +37,7 @@ async function main(): Promise<number> {
     if (
       error instanceof ConfigurationError ||
       error instanceof BashConfigurationError ||
+      error instanceof ToolOutputStoreConfigurationError ||
       error instanceof WorkspaceConfigurationError
     ) {
       process.stderr.write(`${error.message}\n`);

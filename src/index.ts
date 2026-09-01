@@ -33,4 +33,15 @@ export { BashTool } from "./runtime/bash-tool.js";
 export type { BashResult, BashToolOptions } from "./runtime/bash-tool.js";
 export { GrepTool } from "./runtime/grep-tool.js";
 export { ReadTool } from "./runtime/read-tool.js";
+export {
+  ToolOutputStore,
+  ToolOutputStoreConfigurationError,
+} from "./runtime/tool-output-store.js";
+export type {
+  ToolOutputLocation,
+  ToolOutputPair,
+  ToolOutputStoreOptions,
+  ToolOutputWriter,
+} from "./runtime/tool-output-store.js";
 export { ToolRuntime } from "./runtime/tool-runtime.js";
+export type { BashRuntimeOptions } from "./runtime/tool-runtime.js";

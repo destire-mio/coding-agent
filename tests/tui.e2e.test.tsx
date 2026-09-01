@@ -15,6 +15,7 @@ import type {
 } from "../src/core/contracts.js";
 import { ProviderError } from "../src/core/provider-error.js";
 import { BashTool, type BashResult } from "../src/runtime/bash-tool.js";
+import { ToolOutputStore } from "../src/runtime/tool-output-store.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import type {
   RuntimeTool,
@@ -311,7 +312,10 @@ it("runs a real foreground Bash command only after TUI approval", async () => {
   const workspace = join(root, "workspace");
   await mkdir(workspace);
 
-  const runtime = await ToolRuntime.withBash({ workspaceRoot: workspace });
+  const runtime = await ToolRuntime.withBash({
+    workspaceRoot: workspace,
+    toolOutputRoot: join(root, "tool-output"),
+  });
   const provider = new StreamingScriptedProvider([
     {
       kind: "tool_calls",
@@ -385,6 +389,9 @@ it("routes Esc through Core and stops a real Bash process group", async () => {
   const runtime = new ToolRuntime([
     await BashTool.create({
       workspaceRoot: workspace,
+      outputStore: await ToolOutputStore.create({
+        root: join(root, "tool-output"),
+      }),
       timeoutMs: 30_000,
       terminationGraceMs: 250,
     }),

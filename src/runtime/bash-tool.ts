@@ -2,6 +2,7 @@ import { spawn, type ChildProcess } from "node:child_process";
 import { constants } from "node:fs";
 import { access, realpath, stat } from "node:fs/promises";
 import process from "node:process";
+import type { Readable } from "node:stream";
 import { StringDecoder } from "node:string_decoder";
 import { z } from "zod";
 
@@ -15,6 +16,11 @@ import {
   type ToolApprovalPreparation,
   type ToolOutcome,
 } from "./tool.js";
+import type {
+  ToolOutputPair,
+  ToolOutputStore,
+  ToolOutputWriter,
+} from "./tool-output-store.js";
 
 const DEFAULT_SHELL_PATH = "/bin/bash";
 const DEFAULT_TIMEOUT_MS = 120_000;
@@ -44,6 +50,7 @@ const bashInputSchema = z
 
 export interface BashToolOptions {
   readonly workspaceRoot: string;
+  readonly outputStore: ToolOutputStore;
   readonly shellPath?: string;
   readonly timeoutMs?: number;
   readonly terminationGraceMs?: number;
@@ -58,6 +65,8 @@ export interface BashResult {
   readonly signal: NodeJS.Signals | null;
   readonly stdout: string;
   readonly stderr: string;
+  readonly stdoutRef: string;
+  readonly stderrRef: string;
   readonly stdoutTruncated: boolean;
   readonly stderrTruncated: boolean;
   readonly processStopped: boolean;
@@ -71,7 +80,7 @@ export class BashTool implements RuntimeTool {
     name: "bash",
     description:
       "Run one foreground Bash command in the workspace after explicit user approval. " +
-      "Use only when Read or Grep cannot complete the task. Background jobs are unsupported.",
+      "Use only when Read or Grep cannot complete the task. The result keeps bounded stdout/stderr previews and separate refs that Read can page for complete output. Background jobs are unsupported.",
     inputSchema: z.toJSONSchema(bashInputSchema, {
       target: "openapi-3.0",
       unrepresentable: "any",
@@ -83,6 +92,7 @@ export class BashTool implements RuntimeTool {
   readonly #timeoutMs: number;
   readonly #terminationGraceMs: number;
   readonly #maxOutputChars: number;
+  readonly #outputStore: ToolOutputStore;
 
   private constructor(
     workspaceRoot: string,
@@ -90,12 +100,14 @@ export class BashTool implements RuntimeTool {
     timeoutMs: number,
     terminationGraceMs: number,
     maxOutputChars: number,
+    outputStore: ToolOutputStore,
   ) {
     this.#workspaceRoot = workspaceRoot;
     this.#shellPath = shellPath;
     this.#timeoutMs = timeoutMs;
     this.#terminationGraceMs = terminationGraceMs;
     this.#maxOutputChars = maxOutputChars;
+    this.#outputStore = outputStore;
   }
 
   static async create(options: BashToolOptions): Promise<BashTool> {
@@ -158,6 +170,7 @@ export class BashTool implements RuntimeTool {
       timeoutMs,
       terminationGraceMs,
       maxOutputChars,
+      options.outputStore,
     );
   }
 
@@ -191,44 +204,99 @@ export class BashTool implements RuntimeTool {
   async #run(command: string, signal?: AbortSignal): Promise<ToolOutcome> {
     const stdout = new BoundedTextCollector(this.#maxOutputChars);
     const stderr = new BoundedTextCollector(this.#maxOutputChars);
+    let logs: ToolOutputPair;
+    try {
+      logs = await this.#outputStore.createPair();
+    } catch {
+      return outputStorageStartFailure(command, this.#workspaceRoot);
+    }
     let child: ChildProcess;
 
     try {
-      child = spawn(this.#shellPath, ["-c", command], {
-        cwd: this.#workspaceRoot,
-        detached: true,
-        env: safeChildEnvironment(process.env),
-        shell: false,
-        stdio: ["ignore", "pipe", "pipe"],
-        windowsHide: true,
-      });
-    } catch (error) {
-      return startFailure(command, this.#workspaceRoot, error);
-    }
-
-    child.stdout?.on("data", (chunk: Buffer) => stdout.push(chunk));
-    child.stderr?.on("data", (chunk: Buffer) => stderr.push(chunk));
-
-    const exitPromise = waitForChild(child);
-    const control = await waitForExitOrStop(
-      exitPromise,
-      signal,
-      this.#timeoutMs,
-    );
-
-    if (control.kind === "exit") {
-      stdout.end();
-      stderr.end();
-      if (control.error !== undefined) {
-        return startFailure(command, this.#workspaceRoot, control.error);
+      try {
+        child = spawn(this.#shellPath, ["-c", command], {
+          cwd: this.#workspaceRoot,
+          detached: true,
+          env: safeChildEnvironment(process.env),
+          shell: false,
+          stdio: ["ignore", "pipe", "pipe"],
+          windowsHide: true,
+        });
+      } catch (error) {
+        return startFailure(
+          command,
+          this.#workspaceRoot,
+          error,
+          logs.stdout.ref,
+          logs.stderr.ref,
+        );
       }
 
-      const residualGroup = processGroupExists(child.pid);
-      if (residualGroup) {
-        const stopped = await terminateProcessGroup(
-          child,
-          this.#terminationGraceMs,
-        );
+      const captures = [
+        captureOutput(child.stdout, stdout, logs.stdout),
+        captureOutput(child.stderr, stderr, logs.stderr),
+      ];
+      const exitPromise = waitForChild(child);
+      const control = await waitForExitOrStop(
+        exitPromise,
+        signal,
+        this.#timeoutMs,
+        firstCaptureFailure(captures),
+      );
+
+      if (control.kind === "exit") {
+        const captureError = await captureErrorFrom(captures);
+        stdout.end();
+        stderr.end();
+        if (control.error !== undefined) {
+          return startFailure(
+            command,
+            this.#workspaceRoot,
+            control.error,
+            logs.stdout.ref,
+            logs.stderr.ref,
+          );
+        }
+        if (captureError !== undefined) {
+          return outputStorageFailure(
+            command,
+            this.#workspaceRoot,
+            control.code,
+            control.signal,
+            stdout,
+            stderr,
+            logs,
+            true,
+          );
+        }
+
+        const residualGroup = processGroupExists(child.pid);
+        if (residualGroup) {
+          const stopped = await terminateProcessGroup(
+            child,
+            this.#terminationGraceMs,
+          );
+          const details = bashResult(
+            command,
+            this.#workspaceRoot,
+            control.code,
+            control.signal,
+            stdout,
+            stderr,
+            logs,
+            stopped,
+            "unknown",
+          );
+          return toolError(
+            stopped ? "background_process_not_supported" : "termination_unknown",
+            stopped
+              ? "The command left a background process, which this milestone does not support."
+              : "The command left a process that could not be confirmed stopped.",
+            false,
+            details,
+          );
+        }
+
         const details = bashResult(
           command,
           this.#workspaceRoot,
@@ -236,79 +304,73 @@ export class BashTool implements RuntimeTool {
           control.signal,
           stdout,
           stderr,
-          stopped,
-          "unknown",
+          logs,
+          true,
+          "known",
         );
+        if (control.code === 0) {
+          return { status: "success", output: details };
+        }
         return toolError(
-          stopped ? "background_process_not_supported" : "termination_unknown",
-          stopped
-            ? "The command left a background process, which this milestone does not support."
-            : "The command left a process that could not be confirmed stopped.",
+          "command_failed",
+          `Bash exited with code ${control.code ?? "unknown"}.`,
           false,
           details,
         );
       }
 
+      const stopped = await terminateProcessGroup(child, this.#terminationGraceMs);
+      const exit = await waitForExitAfterTermination(
+        exitPromise,
+        this.#terminationGraceMs,
+      );
+      if (!stopped || exit === undefined) {
+        child.stdout?.destroy();
+        child.stderr?.destroy();
+        child.unref();
+      }
+      const captureError = await captureErrorFrom(captures);
+      stdout.end();
+      stderr.end();
+
       const details = bashResult(
         command,
         this.#workspaceRoot,
-        control.code,
-        control.signal,
+        exit?.code ?? null,
+        exit?.signal ?? null,
         stdout,
         stderr,
-        true,
-        "known",
+        logs,
+        stopped && exit !== undefined,
+        "unknown",
       );
-      if (control.code === 0) {
-        return { status: "success", output: details };
+      if (control.kind === "output_storage_failed" || captureError !== undefined) {
+        return toolError(
+          "output_storage_failed",
+          "Bash was stopped because its complete output could not be stored safely.",
+          false,
+          details,
+        );
+      }
+      if (!details.processStopped) {
+        return toolError(
+          "termination_unknown",
+          "The Bash process group could not be confirmed stopped.",
+          false,
+          details,
+        );
       }
       return toolError(
-        "command_failed",
-        `Bash exited with code ${control.code ?? "unknown"}.`,
+        control.kind === "cancelled" ? "cancelled" : "command_timeout",
+        control.kind === "cancelled"
+          ? "Bash was cancelled and its process group was stopped."
+          : "Bash exceeded its time limit and its process group was stopped.",
         false,
         details,
       );
+    } finally {
+      await logs.close();
     }
-
-    const stopped = await terminateProcessGroup(child, this.#terminationGraceMs);
-    const exit = await waitForExitAfterTermination(
-      exitPromise,
-      this.#terminationGraceMs,
-    );
-    stdout.end();
-    stderr.end();
-    if (!stopped || exit === undefined) {
-      child.stdout?.destroy();
-      child.stderr?.destroy();
-      child.unref();
-    }
-
-    const details = bashResult(
-      command,
-      this.#workspaceRoot,
-      exit?.code ?? null,
-      exit?.signal ?? null,
-      stdout,
-      stderr,
-      stopped && exit !== undefined,
-      "unknown",
-    );
-    if (!details.processStopped) {
-      return toolError(
-        "termination_unknown",
-        "The Bash process group could not be confirmed stopped.",
-        false,
-        details,
-      );
-    }
-    return toolError(
-      control.kind === "cancelled" ? "cancelled" : "command_timeout",
-      control.kind === "cancelled"
-        ? "Bash was cancelled and its process group was stopped."
-        : "Bash exceeded its time limit and its process group was stopped.",
-      false,
-      details,
-    );
   }
 }
 
@@ -319,7 +381,9 @@ type ChildExit = {
   readonly error?: Error;
 };
 
-type ProcessControl = ChildExit | { readonly kind: "cancelled" | "timeout" };
+type ProcessControl = ChildExit | {
+  readonly kind: "cancelled" | "timeout" | "output_storage_failed";
+};
 
 function waitForChild(child: ChildProcess): Promise<ChildExit> {
   return new Promise((resolve) => {
@@ -339,10 +403,45 @@ function waitForChild(child: ChildProcess): Promise<ChildExit> {
   });
 }
 
+async function captureOutput(
+  stream: Readable | null,
+  collector: BoundedTextCollector,
+  writer: ToolOutputWriter,
+): Promise<void> {
+  if (stream === null) {
+    return;
+  }
+  for await (const chunk of stream) {
+    const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk);
+    collector.push(bytes);
+    await writer.write(bytes);
+  }
+}
+
+function firstCaptureFailure(
+  captures: readonly Promise<void>[],
+): Promise<ProcessControl> {
+  return new Promise((resolve) => {
+    for (const capture of captures) {
+      void capture.catch(() => resolve({ kind: "output_storage_failed" }));
+    }
+  });
+}
+
+async function captureErrorFrom(
+  captures: readonly Promise<void>[],
+): Promise<unknown | undefined> {
+  const results = await Promise.allSettled(captures);
+  return results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  )?.reason;
+}
+
 async function waitForExitOrStop(
   exit: Promise<ChildExit>,
   signal: AbortSignal | undefined,
   timeoutMs: number,
+  captureFailure: Promise<ProcessControl>,
 ): Promise<ProcessControl> {
   let timeout: ReturnType<typeof setTimeout> | undefined;
   let onAbort: (() => void) | undefined;
@@ -359,7 +458,7 @@ async function waitForExitOrStop(
   });
 
   try {
-    return await Promise.race([exit, stop]);
+    return await Promise.race([exit, stop, captureFailure]);
   } finally {
     if (timeout !== undefined) {
       clearTimeout(timeout);
@@ -461,6 +560,7 @@ function bashResult(
   signal: NodeJS.Signals | null,
   stdout: BoundedTextCollector,
   stderr: BoundedTextCollector,
+  logs: ToolOutputPair,
   processStopped: boolean,
   sideEffectOutcome: "known" | "unknown",
 ): BashResult {
@@ -472,6 +572,8 @@ function bashResult(
     signal,
     stdout: stdout.text,
     stderr: stderr.text,
+    stdoutRef: logs.stdout.ref,
+    stderrRef: logs.stderr.ref,
     stdoutTruncated: stdout.truncated,
     stderrTruncated: stderr.truncated,
     processStopped,
@@ -483,6 +585,8 @@ function startFailure(
   command: string,
   cwd: string,
   error: unknown,
+  stdoutRef: string,
+  stderrRef: string,
 ): ToolOutcome {
   const code = isNodeError(error) ? error.code : undefined;
   return toolError(
@@ -495,9 +599,60 @@ function startFailure(
       command,
       cwd,
       commandStarted: false,
+      exitCode: null,
+      signal: null,
+      stdout: "",
+      stderr: "",
+      stdoutRef,
+      stderrRef,
+      stdoutTruncated: false,
+      stderrTruncated: false,
       processStopped: true,
       sideEffectOutcome: "known",
     },
+  );
+}
+
+function outputStorageStartFailure(command: string, cwd: string): ToolOutcome {
+  return toolError(
+    "output_storage_failed",
+    "Bash was not started because its private output logs could not be created.",
+    false,
+    {
+      command,
+      cwd,
+      commandStarted: false,
+      processStopped: true,
+      sideEffectOutcome: "known",
+    },
+  );
+}
+
+function outputStorageFailure(
+  command: string,
+  cwd: string,
+  exitCode: number | null,
+  signal: NodeJS.Signals | null,
+  stdout: BoundedTextCollector,
+  stderr: BoundedTextCollector,
+  logs: ToolOutputPair,
+  processStopped: boolean,
+): ToolOutcome {
+  return toolError(
+    "output_storage_failed",
+    "Bash completed, but its complete output could not be stored safely.",
+    false,
+    bashResult(
+      command,
+      cwd,
+      exitCode,
+      signal,
+      stdout,
+      stderr,
+      logs,
+      processStopped,
+      "unknown",
+    ),
   );
 }
 

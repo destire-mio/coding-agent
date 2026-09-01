@@ -1,3 +1,6 @@
+import { realpath } from "node:fs/promises";
+import { isAbsolute, relative, sep } from "node:path";
+
 import type {
   Observation,
   ToolCall,
@@ -9,6 +12,16 @@ import { BashTool } from "./bash-tool.js";
 import { GrepTool } from "./grep-tool.js";
 import { ReadTool, type ReadToolOptions } from "./read-tool.js";
 import type { RuntimeTool } from "./tool.js";
+import {
+  ToolOutputStore,
+  ToolOutputStoreConfigurationError,
+} from "./tool-output-store.js";
+
+export interface BashRuntimeOptions {
+  readonly workspaceRoot: string;
+  readonly maxReadBytes?: number;
+  readonly toolOutputRoot?: string;
+}
 
 export class ToolRuntime implements ToolExecutor {
   readonly #tools: ReadonlyMap<string, RuntimeTool>;
@@ -31,11 +44,33 @@ export class ToolRuntime implements ToolExecutor {
     ]);
   }
 
-  static async withBash(options: ReadToolOptions): Promise<ToolRuntime> {
+  static async withBash(options: BashRuntimeOptions): Promise<ToolRuntime> {
+    const outputStore = await ToolOutputStore.create({
+      ...(options.toolOutputRoot === undefined
+        ? {}
+        : { root: options.toolOutputRoot }),
+    });
+    const workspaceRoot = await realpath(options.workspaceRoot).catch(
+      () => options.workspaceRoot,
+    );
+    if (isWithin(workspaceRoot, outputStore.rootPath)) {
+      throw new ToolOutputStoreConfigurationError(
+        "The private tool output store must be outside the workspace.",
+      );
+    }
     return new ToolRuntime([
-      await ReadTool.create(options),
+      await ReadTool.create({
+        workspaceRoot: options.workspaceRoot,
+        ...(options.maxReadBytes === undefined
+          ? {}
+          : { maxReadBytes: options.maxReadBytes }),
+        toolOutputStore: outputStore,
+      }),
       await GrepTool.create({ workspaceRoot: options.workspaceRoot }),
-      await BashTool.create({ workspaceRoot: options.workspaceRoot }),
+      await BashTool.create({
+        workspaceRoot: options.workspaceRoot,
+        outputStore,
+      }),
     ]);
   }
 
@@ -140,6 +175,16 @@ export class ToolRuntime implements ToolExecutor {
       );
     }
   }
+}
+
+function isWithin(root: string, candidate: string): boolean {
+  const relativePath = relative(root, candidate);
+  return (
+    relativePath === "" ||
+    (relativePath !== ".." &&
+      !relativePath.startsWith(`..${sep}`) &&
+      !isAbsolute(relativePath))
+  );
 }
 
 function errorObservation(

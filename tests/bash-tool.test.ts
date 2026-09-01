@@ -9,6 +9,7 @@ import {
   BashTool,
   type BashResult,
 } from "../src/runtime/bash-tool.js";
+import { ToolOutputStore } from "../src/runtime/tool-output-store.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 
 const temporaryRoots: string[] = [];
@@ -24,7 +25,7 @@ describe("BashTool", () => {
   it("rejects invalid Bash parameters before requesting approval", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({ workspaceRoot: workspace }),
+      await createBashTool(workspace),
     ]);
     let approvalCount = 0;
 
@@ -53,7 +54,7 @@ describe("BashTool", () => {
     const workspace = await createWorkspace();
     vi.stubEnv("DEEPSEEK_API_KEY", "MUST_NOT_REACH_CHILD");
     const runtime = new ToolRuntime([
-      await BashTool.create({ workspaceRoot: workspace }),
+      await createBashTool(workspace),
     ]);
 
     const observation = await runtime.execute(
@@ -81,7 +82,7 @@ describe("BashTool", () => {
   it("returns non-zero exits as command_failed with stdout and stderr evidence", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({ workspaceRoot: workspace }),
+      await createBashTool(workspace),
     ]);
 
     const observation = await runtime.execute(
@@ -102,7 +103,7 @@ describe("BashTool", () => {
   it("reports a missing command as a completed Bash failure", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({ workspaceRoot: workspace }),
+      await createBashTool(workspace),
     ]);
 
     const observation = await runtime.execute(
@@ -119,7 +120,7 @@ describe("BashTool", () => {
   it("bounds captured output while continuing to drain the process", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({ workspaceRoot: workspace, maxOutputChars: 5 }),
+      await createBashTool(workspace, { maxOutputChars: 5 }),
     ]);
 
     const observation = await runtime.execute(bashCall("printf '123456789'"), {
@@ -134,8 +135,7 @@ describe("BashTool", () => {
   it("times out and terminates the whole process group", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({
-        workspaceRoot: workspace,
+      await createBashTool(workspace, {
         timeoutMs: 150,
         terminationGraceMs: 250,
       }),
@@ -159,8 +159,7 @@ describe("BashTool", () => {
   it("cancels and terminates the whole process group", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({
-        workspaceRoot: workspace,
+      await createBashTool(workspace, {
         timeoutMs: 30_000,
         terminationGraceMs: 250,
       }),
@@ -186,8 +185,7 @@ describe("BashTool", () => {
   it("cleans up and rejects a detached background command", async () => {
     const workspace = await createWorkspace();
     const runtime = new ToolRuntime([
-      await BashTool.create({
-        workspaceRoot: workspace,
+      await createBashTool(workspace, {
         terminationGraceMs: 250,
       }),
     ]);
@@ -233,6 +231,23 @@ async function createWorkspace(): Promise<string> {
   const workspace = await mkdtemp(join(tmpdir(), "coding-agent-bash-"));
   temporaryRoots.push(workspace);
   return realpath(workspace);
+}
+
+async function createBashTool(
+  workspace: string,
+  options: {
+    readonly timeoutMs?: number;
+    readonly terminationGraceMs?: number;
+    readonly maxOutputChars?: number;
+  } = {},
+): Promise<BashTool> {
+  const outputRoot = await mkdtemp(join(tmpdir(), "coding-agent-output-"));
+  temporaryRoots.push(outputRoot);
+  return BashTool.create({
+    workspaceRoot: workspace,
+    outputStore: await ToolOutputStore.create({ root: outputRoot }),
+    ...options,
+  });
 }
 
 async function expectProcessGone(pid: number): Promise<void> {

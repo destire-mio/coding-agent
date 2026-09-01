@@ -4,19 +4,42 @@ import { open, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep, win32 } from "node:path";
 import { z } from "zod";
 
+import type { ToolDefinition } from "../core/contracts.js";
 import type { RuntimeTool, ToolOutcome } from "./tool.js";
 import { toolError } from "./tool.js";
+import type { ToolOutputStore } from "./tool-output-store.js";
 
 const DEFAULT_MAX_READ_BYTES = 128 * 1024;
 const MAX_CURSOR_LENGTH = 2048;
 const CURSOR_SECRET_BYTES = 32;
-const readArgumentsSchema = z
+const workspaceCursorSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .max(MAX_CURSOR_LENGTH)
+  .optional()
+  .describe(
+    "The exact nextCursor returned by a previous Read page for the same file. Omit to start from the beginning.",
+  );
+const workspaceReadArgumentsSchema = z
   .object({
     path: z
       .string()
       .trim()
       .min(1)
       .describe("A path relative to the workspace root, for example README.md."),
+    cursor: workspaceCursorSchema,
+  })
+  .strict();
+const toolOutputReadArgumentsSchema = z
+  .object({
+    ref: z
+      .string()
+      .trim()
+      .min(1)
+      .describe(
+        "An exact stdoutRef or stderrRef returned by Bash. It grants access to that one private output log.",
+      ),
     cursor: z
       .string()
       .trim()
@@ -24,11 +47,18 @@ const readArgumentsSchema = z
       .max(MAX_CURSOR_LENGTH)
       .optional()
       .describe(
-        "The exact nextCursor returned by a previous Read page for the same file. Omit to start from the beginning.",
+        "The exact nextCursor returned by a previous Read page for the same output ref. Omit to start from the beginning.",
       ),
   })
   .strict();
-const readInputSchema = z.toJSONSchema(readArgumentsSchema, {
+const readArgumentsSchema = z.union([
+  workspaceReadArgumentsSchema,
+  toolOutputReadArgumentsSchema,
+]);
+const workspaceReadInputSchema = z.toJSONSchema(workspaceReadArgumentsSchema, {
+  target: "openapi-3.0",
+});
+const refReadInputSchema = z.toJSONSchema(readArgumentsSchema, {
   target: "openapi-3.0",
 });
 
@@ -57,30 +87,42 @@ type ReadCursor = z.infer<typeof readCursorSchema>;
 export interface ReadToolOptions {
   readonly workspaceRoot: string;
   readonly maxReadBytes?: number;
+  readonly toolOutputStore?: ToolOutputStore;
 }
 
 export class WorkspaceConfigurationError extends Error {}
 
 export class ReadTool implements RuntimeTool {
-  readonly definition = {
-    name: "read",
-    description:
-      "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
-    inputSchema: readInputSchema,
-  } as const;
+  readonly definition: ToolDefinition;
 
   readonly #workspaceRoot: string;
   readonly #maxReadBytes: number;
   readonly #cursorSecret: Buffer;
+  readonly #toolOutputStore: ToolOutputStore | undefined;
 
   private constructor(
     workspaceRoot: string,
     maxReadBytes: number,
     cursorSecret: Buffer,
+    toolOutputStore: ToolOutputStore | undefined,
   ) {
     this.#workspaceRoot = workspaceRoot;
     this.#maxReadBytes = maxReadBytes;
     this.#cursorSecret = cursorSecret;
+    this.#toolOutputStore = toolOutputStore;
+    this.definition = toolOutputStore === undefined
+      ? {
+          name: "read",
+          description:
+            "Read one bounded UTF-8 text page inside the workspace. The path must be relative to the workspace root. When complete is false, call Read again with the same path and pass the returned nextCursor value as the cursor argument.",
+          inputSchema: workspaceReadInputSchema,
+        }
+      : {
+          name: "read",
+          description:
+            "Read one bounded UTF-8 text page from exactly one source: either a workspace-relative path or a Bash stdoutRef/stderrRef. Never send both. When complete is false, repeat the same path or ref with the returned nextCursor.",
+          inputSchema: refReadInputSchema,
+        };
   }
 
   static async create(options: ReadToolOptions): Promise<ReadTool> {
@@ -111,6 +153,7 @@ export class ReadTool implements RuntimeTool {
       workspaceRoot,
       maxReadBytes,
       randomBytes(CURSOR_SECRET_BYTES),
+      options.toolOutputStore,
     );
   }
 
@@ -119,45 +162,75 @@ export class ReadTool implements RuntimeTool {
     if (!parsed.success) {
       return toolError(
         "invalid_arguments",
-        "Read expects a non-empty path and, when continuing, the exact cursor returned by the previous page.",
-      );
-    }
-
-    const requestedPath = parsed.data.path;
-    if (
-      requestedPath.includes("\0") ||
-      isAbsolute(requestedPath) ||
-      win32.isAbsolute(requestedPath)
-    ) {
-      return toolError(
-        "path_outside_workspace",
-        "Read only accepts relative paths inside the workspace.",
-      );
-    }
-
-    const lexicalPath = resolve(this.#workspaceRoot, requestedPath);
-    if (!isWithin(this.#workspaceRoot, lexicalPath)) {
-      return toolError(
-        "path_outside_workspace",
-        "The requested path is outside the workspace.",
+        "Read expects exactly one source (path or ref) and, when continuing, the exact cursor returned by the previous page.",
       );
     }
 
     let canonicalPath: string;
-    try {
-      canonicalPath = await realpath(lexicalPath);
-    } catch (error) {
-      if (isNodeError(error) && error.code === "ENOENT") {
-        return toolError("not_found", "The requested file does not exist.");
+    let cursorIdentity: string;
+    let source: { readonly path: string } | { readonly ref: string };
+    if ("path" in parsed.data) {
+      const requestedPath = parsed.data.path;
+      if (
+        requestedPath.includes("\0") ||
+        isAbsolute(requestedPath) ||
+        win32.isAbsolute(requestedPath)
+      ) {
+        return toolError(
+          "path_outside_workspace",
+          "Read only accepts relative paths inside the workspace.",
+        );
       }
-      return toolError("read_failed", "The requested file could not be resolved.");
-    }
 
-    if (!isWithin(this.#workspaceRoot, canonicalPath)) {
-      return toolError(
-        "path_outside_workspace",
-        "The requested path resolves outside the workspace.",
+      const lexicalPath = resolve(this.#workspaceRoot, requestedPath);
+      if (!isWithin(this.#workspaceRoot, lexicalPath)) {
+        return toolError(
+          "path_outside_workspace",
+          "The requested path is outside the workspace.",
+        );
+      }
+
+      try {
+        canonicalPath = await realpath(lexicalPath);
+      } catch (error) {
+        if (isNodeError(error) && error.code === "ENOENT") {
+          return toolError("not_found", "The requested file does not exist.");
+        }
+        return toolError(
+          "read_failed",
+          "The requested file could not be resolved.",
+        );
+      }
+
+      if (!isWithin(this.#workspaceRoot, canonicalPath)) {
+        return toolError(
+          "path_outside_workspace",
+          "The requested path resolves outside the workspace.",
+        );
+      }
+      const displayPath = toPortableRelativePath(
+        this.#workspaceRoot,
+        canonicalPath,
       );
+      source = { path: displayPath };
+      cursorIdentity = `workspace:${displayPath}`;
+    } else {
+      if (this.#toolOutputStore === undefined) {
+        return toolError(
+          "invalid_ref",
+          "This Runtime has no private tool output store.",
+        );
+      }
+      const location = await this.#toolOutputStore.resolve(parsed.data.ref);
+      if (location === undefined) {
+        return toolError(
+          "invalid_ref",
+          "The tool output ref is invalid, unknown, or no longer available.",
+        );
+      }
+      canonicalPath = location.path;
+      source = { ref: location.ref };
+      cursorIdentity = `tool-output:${location.ref}`;
     }
 
     let fileHandle;
@@ -177,7 +250,6 @@ export class ReadTool implements RuntimeTool {
         );
       }
 
-      const displayPath = toPortableRelativePath(this.#workspaceRoot, canonicalPath);
       const initialVersion = toFileVersion(initialStat);
       let offset = 0;
       let startLine = 1;
@@ -186,7 +258,7 @@ export class ReadTool implements RuntimeTool {
       if (parsed.data.cursor !== undefined) {
         const cursor = decodeCursor(
           parsed.data.cursor,
-          displayPath,
+          cursorIdentity,
           this.#cursorSecret,
         );
         if (cursor === undefined) {
@@ -272,7 +344,7 @@ export class ReadTool implements RuntimeTool {
       return {
         status: "success",
         output: {
-          path: displayPath,
+          ...source,
           bytes: pageBytes.byteLength,
           fileBytes,
           content,
@@ -292,7 +364,7 @@ export class ReadTool implements RuntimeTool {
                     continuedLine: continuesOnNextPage,
                     file: initialVersion,
                   },
-                  displayPath,
+                  cursorIdentity,
                   this.#cursorSecret,
                 ),
               }),

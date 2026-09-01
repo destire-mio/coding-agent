@@ -39,10 +39,9 @@ and result offset, but files changing between calls may still cause repeated or
 missed matches. Grep always filters sensitive files and VCS metadata. A timeout
 discards partial matches and returns `search_timeout`.
 
-Large Read and Grep results stay inside this bounded paging contract. The
-current v1 does not write complete results to an Artifact or return an external
-result reference; that extra storage lifecycle is deferred until a real use case
-requires a stable snapshot or later reuse of the complete result.
+Large workspace Read and Grep results stay inside this bounded paging contract.
+Bash is the first tool whose complete output is stored externally, because
+rerunning a side-effecting command merely to recover truncated output is unsafe.
 
 This milestone trusts the workspace to be controlled by the current user. The
 Runtime rejects lexical and resolved path escapes, and Read refuses to follow a
@@ -61,11 +60,21 @@ Esc or timeout stops the whole group with TERM followed by KILL. Background jobs
 that remain in the managed process group are rejected and cleaned up; this is
 still not an OS sandbox against a process that deliberately escapes that group.
 
-This is still an intermediate Bash milestone. stdout and stderr are captured
-separately but only as bounded 32,768-character previews; complete output is not
-yet persisted for reference-based Read. Commands with large output can therefore
-report `stdoutTruncated` or `stderrTruncated`. Do not treat this local commit as
-the completed Bash milestone until durable logs and reference paging are added.
+stdout and stderr are captured separately as bounded 32,768-character previews
+and streamed in full to private files under `~/.coding-agent/tool-output/` by
+default. Runtime returns a separate unguessable capability ref for each stream.
+The existing Read tool accepts exactly one of a workspace-relative `path` or a
+Runtime `ref`; both reuse the same bounded UTF-8 paging semantics, but follow
+separate authorization paths. The private store must remain outside the
+workspace, is not exposed as an arbitrary readable directory, and defaults to
+directory mode `0700` with log files created as `0600`.
+
+Refs can reopen completed logs after an Agent restart. Read cursors remain
+process-local integrity tokens, so after restart the model starts again from the
+same ref without an old cursor. Log expiry and garbage collection are not yet
+implemented; retained files currently require explicit local cleanup. Binary
+output is preserved in the log, but the current text-only Read tool rejects a
+ref whose requested page is not valid UTF-8.
 
 Core also owns the lifecycle of one active run:
 
@@ -154,7 +163,8 @@ Grep page output
 = pattern + path + bounded matches(path/line/text) + complete + optional nextCursor
 
 Bash output
-= command + cwd + exitCode/signal + bounded stdout/stderr + process outcome
+= command + cwd + exitCode/signal + bounded stdout/stderr + separate
+  stdoutRef/stderrRef + process outcome
 
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
