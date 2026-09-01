@@ -7,6 +7,7 @@ import { render } from "ink";
 import { AgentCore } from "./core/agent-core.js";
 import { ConfigurationError, loadProviderConfig } from "./provider/config.js";
 import { OpenAICompatibleProvider } from "./provider/openai-compatible-provider.js";
+import { BashConfigurationError } from "./runtime/bash-tool.js";
 import { WorkspaceConfigurationError } from "./runtime/read-tool.js";
 import { ToolRuntime } from "./runtime/tool-runtime.js";
 import { AgentApp } from "./tui/agent-app.js";
@@ -30,10 +31,11 @@ async function main(): Promise<number> {
   let runtime: ToolRuntime;
   try {
     providerConfig = loadProviderConfig();
-    runtime = await ToolRuntime.readOnly({ workspaceRoot: options.workspace });
+    runtime = await ToolRuntime.withBash({ workspaceRoot: options.workspace });
   } catch (error) {
     if (
       error instanceof ConfigurationError ||
+      error instanceof BashConfigurationError ||
       error instanceof WorkspaceConfigurationError
     ) {
       process.stderr.write(`${error.message}\n`);

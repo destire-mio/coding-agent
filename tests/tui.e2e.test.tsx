@@ -1,6 +1,7 @@
 import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import process from "node:process";
 import { afterEach, expect, it } from "vitest";
 import { render } from "ink-testing-library";
 
@@ -13,6 +14,7 @@ import type {
   RunResult,
 } from "../src/core/contracts.js";
 import { ProviderError } from "../src/core/provider-error.js";
+import { BashTool, type BashResult } from "../src/runtime/bash-tool.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import type {
   RuntimeTool,
@@ -303,6 +305,146 @@ it("cancels a pending approval without executing the dangerous tool", async () =
   view.unmount();
 });
 
+it("runs a real foreground Bash command only after TUI approval", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-real-bash-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  const runtime = await ToolRuntime.withBash({ workspaceRoot: workspace });
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [],
+      calls: [
+        {
+          id: "call-real-bash",
+          name: "bash",
+          rawArguments: JSON.stringify({
+            command:
+              "printf 'BASH_TUI_MARKER'; printf 'BASH_TUI_WARNING' >&2",
+          }),
+        },
+      ],
+    },
+    {
+      kind: "final",
+      content: [{ type: "text", text: "The command returned BASH_TUI_MARKER." }],
+    },
+  ]);
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="运行本地标记命令"
+      onComplete={finish}
+    />,
+  );
+
+  await waitForFrame(view, "approval required: bash");
+  view.stdin.write("y");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result.kind).toBe("final_answer");
+  expect(JSON.stringify(provider.requests[1])).toContain("BASH_TUI_MARKER");
+  expect(JSON.stringify(provider.requests[1])).toContain("BASH_TUI_WARNING");
+  const toolMessage = result.messages.find(
+    (message) =>
+      message.role === "tool" && message.toolCallId === "call-real-bash",
+  );
+  expect(toolMessage?.role).toBe("tool");
+  if (toolMessage?.role === "tool") {
+    expect(toolMessage.observation.status).toBe("success");
+    if (toolMessage.observation.status === "success") {
+      const output = toolMessage.observation.output as BashResult;
+      expect(output.stdout).toBe("BASH_TUI_MARKER");
+      expect(output.stderr).toBe("BASH_TUI_WARNING");
+      expect(output.exitCode).toBe(0);
+    }
+  }
+  expect(
+    view.frames.some((frame) =>
+      frame.includes("The command returned BASH_TUI_MARKER."),
+    ),
+  ).toBe(true);
+  view.unmount();
+});
+
+it("routes Esc through Core and stops a real Bash process group", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-bash-cancel-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+
+  const runtime = new ToolRuntime([
+    await BashTool.create({
+      workspaceRoot: workspace,
+      timeoutMs: 30_000,
+      terminationGraceMs: 250,
+    }),
+  ]);
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [],
+      calls: [
+        {
+          id: "call-real-bash-cancel",
+          name: "bash",
+          rawArguments: JSON.stringify({
+            command:
+              'sleep 30 & child=$!; printf "%s" "$child"; wait "$child"',
+          }),
+        },
+      ],
+    },
+  ]);
+  const core = new AgentCore(provider, runtime);
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      initialPrompt="运行后取消"
+      onComplete={finish}
+    />,
+  );
+
+  await waitForFrame(view, "approval required: bash");
+  view.stdin.write("y");
+  await renderTurn(100);
+  view.stdin.write("\u001B");
+  const result = await completion;
+  await renderTurn();
+
+  expect(result).toMatchObject({ kind: "stopped", reason: "cancelled" });
+  const toolMessage = result.messages.find(
+    (message) =>
+      message.role === "tool" &&
+      message.toolCallId === "call-real-bash-cancel",
+  );
+  expect(toolMessage?.role).toBe("tool");
+  if (
+    toolMessage?.role === "tool" &&
+    toolMessage.observation.status === "error"
+  ) {
+    expect(toolMessage.observation.error.code).toBe("cancelled");
+    const details = toolMessage.observation.error.details as BashResult;
+    expect(details.processStopped).toBe(true);
+    await expectProcessGone(Number(details.stdout));
+  }
+  view.unmount();
+});
+
 class TuiApprovalProbeTool implements RuntimeTool {
   readonly definition = {
     name: "bash",
@@ -433,4 +575,23 @@ function approvalCommand(input: unknown): string | undefined {
     return undefined;
   }
   return input.command;
+}
+
+async function expectProcessGone(pid: number): Promise<void> {
+  for (let attempt = 0; attempt < 40; attempt += 1) {
+    try {
+      process.kill(pid, 0);
+    } catch (error) {
+      if (
+        error instanceof Error &&
+        "code" in error &&
+        error.code === "ESRCH"
+      ) {
+        return;
+      }
+      throw error;
+    }
+    await renderTurn(25);
+  }
+  throw new Error(`Process ${pid} is still alive.`);
 }

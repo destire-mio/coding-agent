@@ -29,6 +29,8 @@ export type {
 } from "./core/provider-retry.js";
 export { loadProviderConfig } from "./provider/config.js";
 export { OpenAICompatibleProvider } from "./provider/openai-compatible-provider.js";
+export { BashTool } from "./runtime/bash-tool.js";
+export type { BashResult, BashToolOptions } from "./runtime/bash-tool.js";
 export { GrepTool } from "./runtime/grep-tool.js";
 export { ReadTool } from "./runtime/read-tool.js";
 export { ToolRuntime } from "./runtime/tool-runtime.js";

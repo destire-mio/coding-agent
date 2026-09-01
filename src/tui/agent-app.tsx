@@ -273,7 +273,7 @@ export function AgentApp({
   return (
     <Box flexDirection="column" paddingX={1}>
       <Text bold color="cyan">
-        coding-agent · read-only milestone
+        coding-agent · local workspace
       </Text>
       <Text dimColor>workspace: {workspace}</Text>
 

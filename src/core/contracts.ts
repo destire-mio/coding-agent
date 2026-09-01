@@ -24,6 +24,7 @@ export interface ToolError {
   readonly code: string;
   readonly message: string;
   readonly retryable: boolean;
+  readonly details?: unknown;
 }
 
 export interface ToolApprovalRequest {

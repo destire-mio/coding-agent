@@ -28,6 +28,15 @@ export function toolError(
   code: string,
   message: string,
   retryable = false,
+  details?: unknown,
 ): ToolOutcome {
-  return { status: "error", error: { code, message, retryable } };
+  return {
+    status: "error",
+    error: {
+      code,
+      message,
+      retryable,
+      ...(details === undefined ? {} : { details }),
+    },
+  };
 }

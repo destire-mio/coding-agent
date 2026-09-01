@@ -5,6 +5,7 @@ import type {
   ToolExecutionOptions,
   ToolExecutor,
 } from "../core/contracts.js";
+import { BashTool } from "./bash-tool.js";
 import { GrepTool } from "./grep-tool.js";
 import { ReadTool, type ReadToolOptions } from "./read-tool.js";
 import type { RuntimeTool } from "./tool.js";
@@ -27,6 +28,14 @@ export class ToolRuntime implements ToolExecutor {
     return new ToolRuntime([
       await ReadTool.create(options),
       await GrepTool.create({ workspaceRoot: options.workspaceRoot }),
+    ]);
+  }
+
+  static async withBash(options: ReadToolOptions): Promise<ToolRuntime> {
+    return new ToolRuntime([
+      await ReadTool.create(options),
+      await GrepTool.create({ workspaceRoot: options.workspaceRoot }),
+      await BashTool.create({ workspaceRoot: options.workspaceRoot }),
     ]);
   }
 

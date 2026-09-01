@@ -3,7 +3,7 @@
 A build-to-learn Coding Agent project aiming for a runnable, explainable,
 testable, production-grade v1.
 
-## Current milestone: read-only ReAct loop
+## Current milestone: workspace ReAct loop and foreground Bash
 
 The first vertical slice is implemented around one real task:
 
@@ -52,6 +52,21 @@ between the path check and the later Read or ripgrep open. Supporting hostile,
 concurrently mutated workspaces requires descriptor-based path traversal and a
 process sandbox in a later security milestone.
 
+The local CLI also registers a foreground-only Bash tool. Every command is shown
+with its exact workspace cwd and requires a fresh TUI approval before Runtime can
+spawn it. The child receives a small environment allowlist rather than the Agent
+process environment, so Provider credentials such as `DEEPSEEK_API_KEY` are not
+inherited. Bash runs in its own POSIX process group with a fixed 120-second limit;
+Esc or timeout stops the whole group with TERM followed by KILL. Background jobs
+that remain in the managed process group are rejected and cleaned up; this is
+still not an OS sandbox against a process that deliberately escapes that group.
+
+This is still an intermediate Bash milestone. stdout and stderr are captured
+separately but only as bounded 32,768-character previews; complete output is not
+yet persisted for reference-based Read. Commands with large output can therefore
+report `stdoutTruncated` or `stderrTruncated`. Do not treat this local commit as
+the completed Bash milestone until durable logs and reference paging are added.
+
 Core also owns the lifecycle of one active run:
 
 ```text
@@ -63,7 +78,9 @@ The TUI only turns Esc into a cancellation request. Core changes the run state
 and aborts the same signal used by the Provider request, retry wait, and Runtime.
 If Read has already started, it ignores the signal, may finish, and retains its
 real Observation before Core stops. Grep consumes the signal and terminates its
-fixed ripgrep process before returning a cancelled Observation.
+fixed ripgrep process before returning a cancelled Observation. Bash consumes
+the same signal, terminates its complete POSIX process group, preserves bounded
+stdout/stderr evidence, and reports that side effects may have an unknown outcome.
 
 ## Requirements
 
@@ -135,6 +152,9 @@ Read page output
 
 Grep page output
 = pattern + path + bounded matches(path/line/text) + complete + optional nextCursor
+
+Bash output
+= command + cwd + exitCode/signal + bounded stdout/stderr + process outcome
 
 RunResult
 = Core terminal result: final_answer, stopped(max_steps/cancelled), or failed
@@ -215,6 +235,11 @@ The deterministic suite covers:
 - ripgrep regular expressions, live Grep pagination, bounded long-line previews,
   empty matches, signed cursor rejection, workspace escapes, sensitive-file
   filtering, unavailable ripgrep, timeout, and cancellation;
+- dangerous-tool approval failing closed, exact command/cwd display, explicit
+  approval and rejection, and Esc cancellation with zero execution before approval;
+- real foreground Bash execution with fixed cwd, Provider-secret isolation,
+  separate stdout/stderr, non-zero and command-not-found exits, bounded output,
+  timeout/cancellation process-group termination, and background-job cleanup;
 - multiple tool calls executing sequentially in model order;
 - `maxSteps` stopping without claiming completion;
 - missing provider configuration failing closed;
