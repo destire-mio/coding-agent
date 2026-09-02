@@ -56,7 +56,9 @@ it.skipIf(process.platform === "win32")(
     await waitForExit(child);
     await expect(session.acquireRunLease()).rejects.toBeInstanceOf(SessionBusyError);
 
-    await delay(5_500);
+    // proper-lockfile rounds mtimes for filesystem precision, so leave a full
+    // precision interval beyond the 5-second stale policy.
+    await delay(6_500);
     const recovered = await SessionTranscriptStore.openForRun({
       workspaceRoot: workspace,
       root: sessionRoot,
@@ -64,7 +66,7 @@ it.skipIf(process.platform === "win32")(
     });
     await recovered.lease.release();
   },
-  12_000,
+  14_000,
 );
 
 async function waitForOutput(
