@@ -21,6 +21,7 @@ import {
 } from "./session/session-transcript-store.js";
 import {
   foldSessionTranscript,
+  type ReadySessionState,
   type ResumableSessionState,
 } from "./session/session-transcript-fold.js";
 import {
@@ -35,6 +36,7 @@ interface CliOptions {
   readonly maxSteps: number;
   readonly prompt?: string;
   readonly continueSessionId?: string;
+  readonly sessionId?: string;
 }
 
 async function main(): Promise<number> {
@@ -45,17 +47,6 @@ async function main(): Promise<number> {
     process.stderr.write(`${safeMessage(error)}\n\n${usage()}`);
     return 2;
   }
-  if (
-    options.continueSessionId === undefined &&
-    options.prompt === undefined &&
-    !process.stdin.isTTY
-  ) {
-    process.stderr.write(
-      "Interactive mode requires a terminal. Use --prompt for a new task.\n",
-    );
-    return 2;
-  }
-
   let lease: SessionRunLease | undefined;
   const configuredSessionRoot = process.env.CODING_AGENT_SESSION_ROOT?.trim();
   const sessionRoot =
@@ -67,29 +58,51 @@ async function main(): Promise<number> {
     let runtime: ToolRuntime;
     let session: SessionTranscriptStore | undefined;
     let resumeState: ResumableSessionState | undefined;
+    let initialSession: ReadySessionState | undefined;
     try {
-      if (options.continueSessionId !== undefined) {
+      const selectedSessionId = options.continueSessionId ?? options.sessionId;
+      if (selectedSessionId !== undefined) {
         const opened = await SessionTranscriptStore.openForRun({
           workspaceRoot: options.workspace,
-          sessionId: options.continueSessionId,
+          sessionId: selectedSessionId,
           ...(sessionRoot === undefined ? {} : { root: sessionRoot }),
         });
         session = opened.session;
         lease = opened.lease;
         const state = foldSessionTranscript(opened.events);
-        if (state.kind === "no_turn") {
+        if (options.continueSessionId !== undefined) {
+          if (state.kind === "no_turn") {
+            process.stderr.write(
+              `Session ${state.sessionId} has no unfinished Turn to resume.\n`,
+            );
+            return 1;
+          }
+          if (state.kind === "finished") {
+            process.stderr.write(
+              `Session ${state.sessionId} is already finished (${state.turn.outcome}). Use --session ${state.sessionId} to start a new Turn.\n`,
+            );
+            return 1;
+          }
+          resumeState = state;
+        } else if (state.kind === "no_turn" || state.kind === "finished") {
+          initialSession = state;
+        } else {
           process.stderr.write(
-            `Session ${state.sessionId} has no unfinished Turn to resume.\n`,
+            `Session ${state.sessionId} has an unfinished Turn. Use --continue ${state.sessionId} to resume it.\n`,
           );
           return 1;
         }
-        if (state.kind === "finished") {
-          process.stderr.write(
-            `Session ${state.sessionId} is already finished (${state.turn.outcome}).\n`,
-          );
-          return 1;
-        }
-        resumeState = state;
+      }
+
+      if (
+        resumeState === undefined &&
+        options.prompt === undefined &&
+        !process.stdin.isTTY
+      ) {
+        process.stderr.write(
+          "Interactive mode requires a terminal. Use --prompt for a new task.\n",
+        );
+        return 2;
       }
 
       providerConfig = loadProviderConfig();
@@ -130,6 +143,7 @@ async function main(): Promise<number> {
     const core = new AgentCore(provider, runtime, {
       maxSteps: options.maxSteps,
       session,
+      ...(initialSession === undefined ? {} : { initialSession }),
     });
     let exitCode = 1;
 
@@ -161,6 +175,7 @@ function parseArguments(arguments_: readonly string[]): CliOptions {
   let maxSteps = 8;
   let prompt: string | undefined;
   let continueSessionId: string | undefined;
+  let sessionId: string | undefined;
 
   for (let index = 0; index < arguments_.length; index += 1) {
     const argument = arguments_[index];
@@ -188,11 +203,18 @@ function parseArguments(arguments_: readonly string[]): CliOptions {
       continueSessionId = requireValue(arguments_, ++index, "--continue");
       continue;
     }
+    if (argument === "--session") {
+      sessionId = requireValue(arguments_, ++index, "--session");
+      continue;
+    }
     throw new Error(`Unknown argument: ${argument}`);
   }
 
   if (prompt !== undefined && continueSessionId !== undefined) {
     throw new Error("--prompt cannot be combined with --continue.");
+  }
+  if (sessionId !== undefined && continueSessionId !== undefined) {
+    throw new Error("--session cannot be combined with --continue.");
   }
 
   return {
@@ -200,6 +222,7 @@ function parseArguments(arguments_: readonly string[]): CliOptions {
     maxSteps,
     ...(prompt === undefined ? {} : { prompt }),
     ...(continueSessionId === undefined ? {} : { continueSessionId }),
+    ...(sessionId === undefined ? {} : { sessionId }),
   };
 }
 
@@ -220,7 +243,7 @@ function safeMessage(error: unknown): string {
 }
 
 function usage(): string {
-  return `Usage: coding-agent [options]\n\nOptions:\n  --workspace <path>   Workspace root (default: current directory)\n  --prompt <text>      Run one new task immediately instead of prompting\n  --continue <id>      Resume one unfinished Session in this workspace\n  --max-steps <count>  Maximum model rounds (default: 8)\n  -h, --help           Show this help\n`;
+  return `Usage: coding-agent [options]\n\nOptions:\n  --workspace <path>   Workspace root (default: current directory)\n  --prompt <text>      Run one new task immediately instead of prompting\n  --continue <id>      Resume one unfinished Session in this workspace\n  --session <id>       Open an existing idle Session for a new Turn\n  --max-steps <count>  Maximum model rounds (default: 8)\n  -h, --help           Show this help\n`;
 }
 
 void main().then((exitCode) => {

@@ -238,6 +238,70 @@ it("accepts a second task in the same interactive Session", async () => {
   view.unmount();
 });
 
+it("opens a finished Session without a model request until the user submits", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-reopen-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  const session = await SessionTranscriptStore.create({
+    workspaceRoot: workspace,
+    root: join(root, "sessions"),
+    sessionId: "tui-reopen-session",
+  });
+  await session.append({
+    type: "turn_started",
+    turnId: "tui-previous-turn",
+    userInput: "What is this project?",
+  });
+  await session.append({
+    type: "turn_finished",
+    turnId: "tui-previous-turn",
+    outcome: "completed",
+    answer: "A coding agent.",
+    steps: 1,
+  });
+  const previousEvents = await session.load();
+  const initialSession = foldSessionTranscript(previousEvents);
+  if (initialSession.kind !== "finished") {
+    throw new Error("Expected a finished Session.");
+  }
+  const provider = new StreamingScriptedProvider([
+    { kind: "final", content: [{ type: "text", text: "REOPENED_TUI_ANSWER" }] },
+  ]);
+  const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+  const core = new AgentCore(provider, runtime, { session, initialSession });
+  let finish: (result: RunResult) => void = () => undefined;
+  const completion = new Promise<RunResult>((resolve) => {
+    finish = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      sessionId={session.sessionId}
+      onComplete={finish}
+    />,
+  );
+
+  await waitForFrame(view, "task ›");
+  await renderTurn(50);
+  expect(provider.requests).toHaveLength(0);
+  expect(await session.load()).toEqual(previousEvents);
+  expect(view.lastFrame()).toContain("session: tui-reopen-session");
+
+  view.stdin.write("Tell me more");
+  await renderTurn();
+  view.stdin.write("\r");
+  expect((await completion).kind).toBe("final_answer");
+  await waitForFrame(view, "task ›");
+  expect(view.lastFrame()).toContain("REOPENED_TUI_ANSWER");
+  expect(provider.requests[0]?.messages).toEqual([
+    ...initialSession.messages,
+    { role: "user", content: "Tell me more" },
+  ]);
+  view.unmount();
+});
+
 it("auto-starts a selected unfinished Session through Core resume", async () => {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-resume-"));
   temporaryRoots.push(root);

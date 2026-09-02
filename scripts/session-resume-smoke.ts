@@ -5,7 +5,7 @@ import {
   type IncomingMessage,
   type Server,
 } from "node:http";
-import { mkdir, mkdtemp, rm } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -20,6 +20,8 @@ const sessionId = `cli-resume-${randomUUID()}`;
 const repoRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 const requestBodies: unknown[] = [];
 const finalMarker = "CLI_RESUME_FINAL_MARKER";
+const reopenedFinalMarker = "CLI_REOPEN_FINAL_MARKER";
+const children: ChildProcess[] = [];
 let reportFirstRequest: () => void = () => undefined;
 const firstRequestReceived = new Promise<void>((resolveRequest) => {
   reportFirstRequest = resolveRequest;
@@ -48,7 +50,9 @@ const server = createServer(async (request, response) => {
   response.write(
     chunk({ reasoning_content: "The durable Observation is sufficient." }),
   );
-  response.write(chunk({ content: finalMarker }));
+  response.write(chunk({
+    content: requestBodies.length === 1 ? finalMarker : reopenedFinalMarker,
+  }));
   response.write(chunk({}, "stop"));
   response.end("data: [DONE]\n\n");
 });
@@ -114,9 +118,7 @@ try {
       `Competing CLI did not return session_busy. stdout=${secondResult.stdout} stderr=${secondResult.stderr}`,
     );
   }
-  if (requestBodies.length !== 1) {
-    throw new Error("The competing CLI must not contact the Provider.");
-  }
+  assertProviderRequestCount(1);
 
   allowFirstResponse();
   const firstResult = await withTimeout(
@@ -143,13 +145,140 @@ try {
   ) {
     throw new Error("The compiled CLI did not durably finish the resumed Turn.");
   }
-  if (requestBodies.length !== 1) {
-    throw new Error("The resumed CLI must make exactly one Provider request.");
-  }
+  assertProviderRequestCount(1);
   const requestJson = JSON.stringify(requestBodies[0]);
   if (!requestJson.includes("CLI_RESUME_OBSERVATION_MARKER")) {
     throw new Error("The Provider request omitted the durable Observation.");
   }
+
+  const previousEvents = await reopened.load();
+  const newPrompt = "What marker did the previous Read return?";
+  const nextTurn = spawnCli(port, [
+    "--session", sessionId, "--prompt", newPrompt,
+  ]);
+  const nextTurnResult = await withTimeout(
+    nextTurn.completion,
+    5_000,
+    "The reopened CLI did not finish its new Turn.",
+  );
+  if (nextTurnResult.exitCode !== 0) {
+    throw new Error(
+      `Reopened CLI failed. stdout=${nextTurnResult.stdout} stderr=${nextTurnResult.stderr}`,
+    );
+  }
+  assertProviderRequestCount(2);
+  const reopenedRequestJson = JSON.stringify(requestBodies[1]);
+  for (const evidence of [
+    "CLI_RESUME_OBSERVATION_MARKER", "cli-resume-call", finalMarker, newPrompt,
+  ]) {
+    if (!reopenedRequestJson.includes(evidence)) {
+      throw new Error(`The reopened Context omitted ${evidence}.`);
+    }
+  }
+  if (reopenedRequestJson.includes("I need README.md.")) {
+    throw new Error("Completed reasoning leaked into the new Turn Context.");
+  }
+  const afterReopen = await reopened.load();
+  if (
+    JSON.stringify(afterReopen.slice(0, previousEvents.length)) !==
+    JSON.stringify(previousEvents)
+  ) {
+    throw new Error("Reopening a Session changed its previous facts.");
+  }
+  const appended = afterReopen.slice(previousEvents.length);
+  const newStart = appended[0];
+  const newFinish = appended[1];
+  if (
+    appended.length !== 2 ||
+    newStart?.type !== "turn_started" ||
+    newStart.turnId === "cli-resume-turn" ||
+    newStart.userInput !== newPrompt ||
+    newFinish?.type !== "turn_finished" ||
+    newFinish.turnId !== newStart.turnId ||
+    newFinish.answer !== reopenedFinalMarker
+  ) {
+    throw new Error("Reopening did not durably append one distinct new Turn.");
+  }
+
+  const heldLease = await reopened.acquireRunLease();
+  try {
+    const busyReopen = await withTimeout(
+      spawnCli(port, ["--session", sessionId, "--prompt", "New task"]).completion,
+      5_000,
+      "The busy --session invocation did not fail fast.",
+    );
+    if (busyReopen.exitCode !== 1 || !busyReopen.stderr.includes("already running")) {
+      throw new Error("--session did not enforce the existing Session lease.");
+    }
+  } finally {
+    await heldLease.release();
+  }
+
+  const configPath = join(workspace, "config.ts");
+  await writeFile(configPath, "UNCHANGED_CONFIG\n", "utf8");
+  for (const position of ["awaiting_model", "recovering_tool"] as const) {
+    const pendingId = `${sessionId}-${position}`;
+    const pending = await SessionTranscriptStore.create({
+      workspaceRoot: workspace,
+      root: sessionRoot,
+      sessionId: pendingId,
+    });
+    await pending.append({
+      type: "turn_started",
+      turnId: "unfinished-turn",
+      userInput: "Edit config.ts",
+    });
+    if (position === "recovering_tool") {
+      await pending.append({
+        type: "tool_intent",
+        turnId: "unfinished-turn",
+        step: 1,
+        operationId: "unfinished-edit-operation",
+        call: {
+          id: "unfinished-edit-call",
+          name: "edit",
+          rawArguments: JSON.stringify({
+            path: "config.ts",
+            old_string: "UNCHANGED_CONFIG",
+            new_string: "SHOULD_NOT_WRITE",
+            expected_version: "unverified-version",
+          }),
+        },
+        replayContent: [],
+      });
+    }
+    const pendingBefore = await pending.load();
+    const rejected = await withTimeout(
+      spawnCli(port, [
+        "--session", pendingId,
+        ...(position === "recovering_tool" ? ["--prompt", "Skip the old task"] : []),
+      ]).completion,
+      5_000,
+      "The unfinished Session was not rejected promptly.",
+    );
+    if (
+      rejected.exitCode !== 1 ||
+      !rejected.stderr.includes(`Use --continue ${pendingId}`) ||
+      JSON.stringify(await pending.load()) !== JSON.stringify(pendingBefore)
+    ) {
+      throw new Error(`--session skipped or changed an unfinished ${position} Turn.`);
+    }
+  }
+  if (await readFile(configPath, "utf8") !== "UNCHANGED_CONFIG\n") {
+    throw new Error("Rejecting an unfinished Session must not execute its Edit.");
+  }
+  const conflictingFlags = await withTimeout(
+    spawnCli(port, ["--session", sessionId, "--continue", sessionId]).completion,
+    5_000,
+    "Conflicting Session flags were not rejected promptly.",
+  );
+  if (
+    conflictingFlags.exitCode !== 2 ||
+    !conflictingFlags.stderr.includes("--session cannot be combined with --continue.")
+  ) {
+    throw new Error("Rejected Session commands must make zero Provider requests.");
+  }
+  assertProviderRequestCount(2);
 
   process.stdout.write(
     `${JSON.stringify(
@@ -160,6 +289,9 @@ try {
         competingExitCode: secondResult.exitCode,
         recoveredFrom: "awaiting_model",
         finalMarker,
+        reopenedFinalMarker,
+        newTurnId: newStart.turnId,
+        unfinishedPositionsRejected: ["awaiting_model", "recovering_tool"],
       },
       null,
       2,
@@ -167,8 +299,20 @@ try {
   );
 } finally {
   allowFirstResponse();
+  for (const child of children) {
+    if (child.exitCode === null && child.signalCode === null) {
+      child.kill("SIGKILL");
+      await new Promise<void>((resolveExit) => child.once("close", () => resolveExit()));
+    }
+  }
   await new Promise<void>((resolveClose) => server.close(() => resolveClose()));
   await rm(root, { recursive: true, force: true });
+}
+
+function assertProviderRequestCount(expected: number): void {
+  if (requestBodies.length !== expected) {
+    throw new Error(`Expected ${expected} Provider requests, got ${requestBodies.length}.`);
+  }
 }
 
 function chunk(
@@ -213,7 +357,10 @@ interface CliProcessResult {
   readonly stderr: string;
 }
 
-function spawnCli(port: number): {
+function spawnCli(
+  port: number,
+  sessionArguments: readonly string[] = ["--continue", sessionId],
+): {
   readonly child: ChildProcess;
   readonly completion: Promise<CliProcessResult>;
 } {
@@ -223,8 +370,7 @@ function spawnCli(port: number): {
       join(repoRoot, "dist", "cli.js"),
       "--workspace",
       workspace,
-      "--continue",
-      sessionId,
+      ...sessionArguments,
       "--max-steps",
       "4",
     ],
@@ -240,6 +386,7 @@ function spawnCli(port: number): {
       stdio: ["ignore", "pipe", "pipe"],
     },
   );
+  children.push(child);
   const stdout: Buffer[] = [];
   const stderr: Buffer[] = [];
   child.stdout?.on("data", (data: Buffer) => stdout.push(data));

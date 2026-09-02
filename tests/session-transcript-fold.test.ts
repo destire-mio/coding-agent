@@ -43,6 +43,7 @@ describe("Session transcript fold", () => {
     expect(foldSessionTranscript(await store.load())).toEqual({
       kind: "no_turn",
       sessionId: "fold-empty",
+      messages: [],
     });
   });
 
@@ -135,6 +136,14 @@ describe("Session transcript fold", () => {
         outcome: "completed",
         answer: "README summary",
       },
+      messages: [
+        { role: "user", content: "Read README.md" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "README summary" }],
+          toolCalls: [],
+        },
+      ],
     });
   });
 
@@ -211,6 +220,115 @@ describe("Session transcript fold", () => {
 
     expect(() => foldSessionTranscript(events)).toThrow(
       SessionTranscriptCorruptError,
+    );
+  });
+});
+
+describe("Core finished-Session reopening", () => {
+  it("loads history without execution and starts a distinct Turn on new input", async () => {
+    const harness = await createStoreHarness("reopen-finished");
+    await appendTurnStart(harness.store, "previous-turn");
+    await harness.store.append(intent("previous-turn"));
+    await harness.store.append(observation("previous-turn"));
+    await harness.store.append({
+      type: "turn_finished",
+      turnId: "previous-turn",
+      outcome: "completed",
+      answer: "README summary",
+      steps: 2,
+    });
+    const previousEvents = await harness.store.load();
+    const opened = await SessionTranscriptStore.openForRun({
+      workspaceRoot: harness.workspace,
+      root: join(harness.root, "sessions"),
+      sessionId: harness.store.sessionId,
+    });
+
+    try {
+      const state = foldSessionTranscript(opened.events);
+      if (state.kind !== "finished") {
+        throw new Error("Expected a finished Session.");
+      }
+      const requests: ModelRequest[] = [];
+      let runtimeCalls = 0;
+      const core = new AgentCore(
+        {
+          complete: async (request) => {
+            requests.push(request);
+            return {
+              kind: "final",
+              content: [{ type: "text", text: "The heading was README." }],
+            };
+          },
+        },
+        {
+          definitions: () => [],
+          execute: async () => {
+            runtimeCalls += 1;
+            throw new Error("Opening history must not rerun an old tool.");
+          },
+        },
+        { session: opened.session, initialSession: state },
+      );
+
+      expect(core.state).toEqual({ phase: "idle" });
+      expect(requests).toHaveLength(0);
+      expect(runtimeCalls).toBe(0);
+      expect(await opened.session.load()).toEqual(previousEvents);
+
+      const result = await core.run("What was the heading?");
+
+      expect(result.kind).toBe("final_answer");
+      expect(runtimeCalls).toBe(0);
+      expect(requests).toHaveLength(1);
+      expect(requests[0]?.messages).toEqual([
+        ...state.messages,
+        { role: "user", content: "What was the heading?" },
+      ]);
+      expect(JSON.stringify(requests[0])).toContain("# README");
+      expect(JSON.stringify(requests[0])).not.toContain("I need the file.");
+      const events = await opened.session.load();
+      expect(events.slice(0, previousEvents.length)).toEqual(previousEvents);
+      const newEvents = events.slice(previousEvents.length);
+      expect(newEvents).toMatchObject([
+        { type: "turn_started", userInput: "What was the heading?" },
+        { type: "turn_finished", outcome: "completed" },
+      ]);
+      const started = newEvents[0];
+      if (started?.type !== "turn_started") {
+        throw new Error("Expected a new turn_started record.");
+      }
+      expect(started.turnId).not.toBe("previous-turn");
+    } finally {
+      await opened.lease.release();
+    }
+  });
+
+  it("refuses history from a different Session writer", async () => {
+    const source = await createStore("reopen-source");
+    const destination = await createStore("reopen-destination");
+    const state = foldSessionTranscript(await source.load());
+    if (state.kind !== "no_turn") {
+      throw new Error("Expected an empty Session.");
+    }
+    expect(
+      () =>
+        new AgentCore(
+          {
+            complete: async () => {
+              throw new Error("Must not call Provider.");
+            },
+          },
+          {
+            definitions: () => [],
+            execute: async () => {
+              throw new Error("Must not execute a tool.");
+            },
+          },
+          { session: destination, initialSession: state },
+        ),
+    ).toThrow(
+      "AgentCore initial Session requires the matching Session event writer.",
     );
   });
 });

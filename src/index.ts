@@ -88,6 +88,7 @@ export {
 export { foldSessionTranscript } from "./session/session-transcript-fold.js";
 export type {
   AwaitingModelResumeState,
+  ReadySessionState,
   ResumableSessionState,
   SessionResumeState,
 } from "./session/session-transcript-fold.js";

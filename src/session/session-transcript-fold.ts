@@ -11,11 +11,16 @@ type TurnFinishedEvent = Extract<SessionEvent, { type: "turn_finished" }>;
 type ToolIntentEvent = Extract<SessionEvent, { type: "tool_intent" }>;
 
 export type SessionResumeState =
-  | { readonly kind: "no_turn"; readonly sessionId: string }
+  | {
+      readonly kind: "no_turn";
+      readonly sessionId: string;
+      readonly messages: readonly AgentMessage[];
+    }
   | {
       readonly kind: "finished";
       readonly sessionId: string;
       readonly turn: TurnFinishedEvent;
+      readonly messages: readonly AgentMessage[];
     }
   | {
       readonly kind: "awaiting_model";
@@ -41,6 +46,11 @@ export type AwaitingModelResumeState = Extract<
 export type ResumableSessionState = Extract<
   SessionResumeState,
   { readonly kind: "awaiting_model" | "recovering_tool" }
+>;
+
+export type ReadySessionState = Extract<
+  SessionResumeState,
+  { readonly kind: "no_turn" | "finished" }
 >;
 
 interface ActiveTurn {
@@ -171,8 +181,13 @@ export function foldSessionTranscript(
 
   if (active === undefined) {
     return latestFinished === undefined
-      ? { kind: "no_turn", sessionId }
-      : { kind: "finished", sessionId, turn: latestFinished };
+      ? { kind: "no_turn", sessionId, messages: [] }
+      : {
+          kind: "finished",
+          sessionId,
+          turn: latestFinished,
+          messages: completedContext,
+        };
   }
   if (active.pendingIntent !== undefined) {
     return {

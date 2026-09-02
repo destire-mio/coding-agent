@@ -39,6 +39,7 @@ import type {
   SessionEventWriter,
 } from "../session/session-transcript-store.js";
 import type {
+  ReadySessionState,
   ResumableSessionState,
 } from "../session/session-transcript-fold.js";
 
@@ -64,6 +65,7 @@ export interface AgentCoreOptions {
   readonly systemPrompt?: string;
   readonly providerRetry?: ProviderRetryOptions;
   readonly session?: SessionEventWriter;
+  readonly initialSession?: ReadySessionState;
 }
 
 export interface RunOptions {
@@ -99,6 +101,14 @@ export class AgentCore {
     this.#systemPrompt = options.systemPrompt ?? DEFAULT_SYSTEM_PROMPT;
     this.#providerRetry = resolveProviderRetryPolicy(options.providerRetry);
     this.#session = options.session;
+    if (options.initialSession !== undefined) {
+      if (this.#session?.sessionId !== options.initialSession.sessionId) {
+        throw new Error(
+          "AgentCore initial Session requires the matching Session event writer.",
+        );
+      }
+      this.#contextMessages = [...options.initialSession.messages];
+    }
   }
 
   get state(): AgentRunState {

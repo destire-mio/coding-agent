@@ -153,13 +153,17 @@ redelivered with its original operation identity to the durable Edit journal,
 and Bash or any unclassified tool is never re-executed: Core records a
 `recovery_unknown_outcome` Observation instead. Recovery then continues the
 same loop and durably appends its terminal result. The CLI can explicitly open
-the exact unfinished Session named by `--continue`. It does not yet reopen a
-finished Session in a new process, automatically select a recent Session,
-compact history, list Sessions, or garbage-collect data.
+the exact unfinished Session named by `--continue`. With `--session`, a fresh
+process instead opens an existing Session that has no unfinished Turn, restores
+its completed Context into an idle Core, and waits for new input. Opening it
+does not call the Provider, replay an old tool, or append a Turn. An unfinished
+Session is rejected with a `--continue` hint. The CLI does not automatically
+select a recent Session, compact history, list Sessions, or garbage-collect data.
 
-Every new or resumed CLI run holds one exclusive `.run.lock` in that Session's
-private directory from the pre-fold read through the terminal write. A competing
-`--continue` fails immediately with `session_busy`, before Provider or Runtime
+Every new, resumed, or reopened CLI holds one exclusive `.run.lock` in that
+Session's private directory until the TUI exits, including while awaiting input.
+A competing `--continue` or `--session` fails immediately with `session_busy`,
+before Provider or Runtime
 initialization. The winner acquires the lock and only then loads and folds the
 Transcript, so it cannot continue from a pre-lock snapshot. Normal exit releases
 the lock; a killed process leaves a heartbeat-based lock that becomes stale after
@@ -242,10 +246,24 @@ node --env-file=.env dist/cli.js \
   --continue <session-id>
 ```
 
-`--prompt` creates a new Session and cannot be combined with `--continue`.
-Continuation opens only an existing Session; an unknown ID is not created. A
-Session with no unfinished Turn, or one whose latest Turn is already terminal,
-returns without contacting the Provider. Set `CODING_AGENT_SESSION_ROOT` when
+To reopen a completed conversation and type a new task, use:
+
+```bash
+node --env-file=.env dist/cli.js \
+  --workspace /absolute/path/to/workspace \
+  --session <session-id>
+```
+
+`--session` also accepts an existing empty Session. It refuses to skip an
+unfinished Turn and tells you to use `--continue` instead. Add `--prompt <text>`
+to explicitly submit one new task immediately and exit afterward; without it,
+the TUI waits for your input before making any Provider request.
+
+Without `--session`, a new task creates a new Session. `--continue` cannot be
+combined with either `--session` or `--prompt`. Both Session flags open only an
+existing Session; an unknown ID is not created. `--continue` refuses an empty
+or already finished Session without contacting the Provider.
+Set `CODING_AGENT_SESSION_ROOT` when
 the private Session store should live somewhere other than
 `~/.coding-agent/sessions/`.
 
@@ -551,13 +569,13 @@ importing Kimi's complete Session/Wire stack.
   leftovers. It may still access files, processes, or networks available to the
   current user and may leave side effects before timeout or cancellation; this
   is not an OS sandbox and an unknown outcome is never automatically retried.
-- Arbitrary overwrite, multi-file Edit, MCP, plugins, reopening a finished
-  Session from a fresh process, long-term Memory, multi-agent behavior,
-  background task management, and a complex TUI are intentionally absent.
+- Arbitrary overwrite, multi-file Edit, MCP, plugins, long-term Memory,
+  multi-agent behavior, background task management, and a complex TUI are
+  intentionally absent.
 
 ## Status
 
-On 2026-09-02, the deterministic suite passed 146 tests across 19 test files. The
+On 2026-09-02, the deterministic suite passed 149 tests across 19 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -600,6 +618,18 @@ not executed again during resume. A separate real child-process test kills the
 lock holder with `SIGKILL`, observes the lease remain busy until its 5-second
 stale boundary, and then acquires it from a new process.
 
+The same compiled-CLI smoke then starts another fresh process with
+`--session <id> --prompt <text>`. It verifies that completed ToolCalls,
+Observations, and final answers reach the Provider without old reasoning, and
+exactly one new Turn is appended without changing previous records. Reopening a
+busy Session or either unfinished position is rejected with zero extra Provider
+requests; a pending Edit does not change its file. Conflicting Session flags are
+also rejected. Core and Ink tests separately verify that opening history remains
+idle and makes zero Provider calls until the user submits new input.
+
+Run these deterministic fresh-process checks with `npm run smoke:session-resume`.
+They use a local OpenAI-compatible SSE server, not a paid model request.
+
 The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
 safe marker, and did not expose the `.env` marker. Both streamed reasoning,
@@ -623,8 +653,9 @@ This proves the current minimum chain, deterministic Edit side-effect recovery,
 durable Session write-ahead ordering, and explicit same-Turn continuation from a
 fresh CLI process with one active writer. It also proves later-Turn Context while
 the same interactive TUI remains open and after folding an interrupted second
-Turn. It does not yet prove automatic latest-Session selection, reopening a
-finished Session from a fresh process, power-loss durability at every write
+Turn, plus explicit reopening of a finished Session from a fresh process. It
+does not yet prove automatic latest-Session selection, power-loss durability at
+every write
 boundary, hostile-process resistance for the cooperative lock, a
 hostile-workspace sandbox, or the later complete production milestone.
 
