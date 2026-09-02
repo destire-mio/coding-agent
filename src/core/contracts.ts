@@ -270,3 +270,17 @@ export function assistantThinking(
     .map((part) => (part.type === "think" ? part.think : ""))
     .join("");
 }
+
+/** Keeps completed execution facts while removing private model reasoning. */
+export function projectCompletedContext(
+  messages: readonly AgentMessage[],
+): AgentMessage[] {
+  return messages.map((message) =>
+    message.role === "assistant"
+      ? {
+          ...message,
+          content: message.content.filter((part) => part.type !== "think"),
+        }
+      : message,
+  );
+}

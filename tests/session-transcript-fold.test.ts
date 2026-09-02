@@ -138,6 +138,66 @@ describe("Session transcript fold", () => {
     });
   });
 
+  it("rebuilds completed facts before an unfinished second Turn", async () => {
+    const store = await createStore("fold-second-turn");
+    await store.append({
+      type: "turn_started",
+      turnId: "turn-first",
+      userInput: "Summarize README.md",
+    });
+    await store.append({
+      ...intent("turn-first"),
+      replayContent: [
+        { type: "think", think: "PRIVATE_FIRST_TURN_REASONING" },
+        { type: "text", text: "I will read the file." },
+      ],
+    });
+    await store.append(observation("turn-first"));
+    await store.append({
+      type: "turn_finished",
+      turnId: "turn-first",
+      steps: 2,
+      outcome: "completed",
+      answer: "README summary",
+    });
+    await store.append({
+      type: "turn_started",
+      turnId: "turn-second",
+      userInput: "What is its license?",
+    });
+
+    const state = foldSessionTranscript(await store.load());
+
+    expect(state).toMatchObject({
+      kind: "awaiting_model",
+      turnId: "turn-second",
+      nextStep: 1,
+      messages: [
+        { role: "user", content: "Summarize README.md" },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "I will read the file." }],
+          toolCalls: [{ id: "call-read", name: "read" }],
+        },
+        {
+          role: "tool",
+          toolCallId: "call-read",
+          observation: {
+            status: "success",
+            output: { content: "# README" },
+          },
+        },
+        {
+          role: "assistant",
+          content: [{ type: "text", text: "README summary" }],
+          toolCalls: [],
+        },
+        { role: "user", content: "What is its license?" },
+      ],
+    });
+    expect(JSON.stringify(state)).not.toContain("PRIVATE_FIRST_TURN_REASONING");
+  });
+
   it("fails closed when an Observation cannot match its Tool Intent", async () => {
     const store = await createStore("fold-mismatch");
     await appendTurnStart(store, "turn-mismatch");
@@ -530,7 +590,9 @@ async function appendTurnStart(
   });
 }
 
-function intent(turnId: string): SessionEventInput {
+function intent(
+  turnId: string,
+): Extract<SessionEventInput, { type: "tool_intent" }> {
   return toolIntent(turnId, "operation-read", {
     id: "call-read",
     name: "read",

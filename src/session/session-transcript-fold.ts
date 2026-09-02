@@ -1,4 +1,7 @@
-import type { AgentMessage } from "../core/contracts.js";
+import {
+  projectCompletedContext,
+  type AgentMessage,
+} from "../core/contracts.js";
 import {
   SessionTranscriptCorruptError,
   type SessionEvent,
@@ -48,7 +51,7 @@ interface ActiveTurn {
   pendingIntent: ToolIntentEvent | undefined;
 }
 
-/** Rebuilds the latest Turn's durable recovery position from Session facts. */
+/** Rebuilds completed Context plus the latest Turn's durable recovery position. */
 export function foldSessionTranscript(
   events: readonly SessionEvent[],
 ): SessionResumeState {
@@ -60,6 +63,7 @@ export function foldSessionTranscript(
   const sessionId = first.sessionId;
   let active: ActiveTurn | undefined;
   let latestFinished: TurnFinishedEvent | undefined;
+  let completedContext: AgentMessage[] = [];
 
   for (const [index, event] of events.entries()) {
     if (event.sessionId !== sessionId) {
@@ -79,7 +83,10 @@ export function foldSessionTranscript(
         }
         active = {
           turnId: event.turnId,
-          messages: [{ role: "user", content: event.userInput }],
+          messages: [
+            ...completedContext,
+            { role: "user", content: event.userInput },
+          ],
           seenToolCallIds: new Set<string>(),
           nextStep: 1,
           pendingIntent: undefined,
@@ -142,11 +149,23 @@ export function foldSessionTranscript(
         break;
       }
 
-      case "turn_finished":
-        requireActiveTurn(active, event.turnId);
+      case "turn_finished": {
+        const finishedTurn = requireActiveTurn(active, event.turnId);
+        if (event.outcome === "completed") {
+          if (event.answer === undefined || event.answer.trim().length === 0) {
+            throw corrupt("A completed Turn must contain its final answer.");
+          }
+          finishedTurn.messages.push({
+            role: "assistant",
+            content: [{ type: "text", text: event.answer }],
+            toolCalls: [],
+          });
+          completedContext = projectCompletedContext(finishedTurn.messages);
+        }
         active = undefined;
         latestFinished = event;
         break;
+      }
     }
   }
 

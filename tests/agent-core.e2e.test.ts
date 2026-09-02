@@ -89,6 +89,88 @@ describe("read-only ReAct end-to-end", () => {
     }
   });
 
+  it("carries completed ToolCall facts into the next Turn without old thinking", async () => {
+    const { workspace } = await createWorkspace();
+    await writeFile(
+      join(workspace, "README.md"),
+      "# Demo\n\nLicense: MIT\n",
+      "utf8",
+    );
+    const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+    const provider = new ScriptedProvider([
+      {
+        kind: "tool_calls",
+        content: [
+          { type: "think", think: "PRIVATE_TOOL_REASONING" },
+          { type: "text", text: "I will inspect README.md." },
+        ],
+        calls: [
+          {
+            id: "call-first-turn-read",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "README.md" }),
+          },
+        ],
+      },
+      {
+        kind: "final",
+        content: [
+          { type: "think", think: "PRIVATE_FINAL_REASONING" },
+          { type: "text", text: "The README describes Demo." },
+        ],
+      },
+      {
+        kind: "final",
+        content: [{ type: "text", text: "Its license is MIT." }],
+      },
+    ]);
+    const core = new AgentCore(provider, runtime, { maxSteps: 4 });
+
+    const first = await core.run("读取 README.md 并总结");
+    const second = await core.run("它的许可证是什么？");
+
+    expect(first.kind).toBe("final_answer");
+    expect(second).toMatchObject({
+      kind: "final_answer",
+      answer: "Its license is MIT.",
+      steps: 1,
+    });
+    expect(provider.requests).toHaveLength(3);
+    const secondTurnRequest = provider.requests[2];
+    expect(secondTurnRequest?.messages).toEqual([
+      { role: "user", content: "读取 README.md 并总结" },
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "I will inspect README.md." }],
+        toolCalls: [
+          {
+            id: "call-first-turn-read",
+            name: "read",
+            rawArguments: JSON.stringify({ path: "README.md" }),
+          },
+        ],
+      },
+      expect.objectContaining({
+        role: "tool",
+        toolCallId: "call-first-turn-read",
+        observation: expect.objectContaining({ status: "success" }),
+      }),
+      {
+        role: "assistant",
+        content: [{ type: "text", text: "The README describes Demo." }],
+        toolCalls: [],
+      },
+      { role: "user", content: "它的许可证是什么？" },
+    ]);
+    expect(JSON.stringify(secondTurnRequest)).toContain("License: MIT");
+    expect(JSON.stringify(secondTurnRequest)).not.toContain(
+      "PRIVATE_TOOL_REASONING",
+    );
+    expect(JSON.stringify(secondTurnRequest)).not.toContain(
+      "PRIVATE_FINAL_REASONING",
+    );
+  });
+
   it("continues a bounded Read with nextCursor before answering", async () => {
     const { workspace } = await createWorkspace();
     const content = "alpha\nbeta\nPAGED_MARKER\n";

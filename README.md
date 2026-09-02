@@ -122,6 +122,15 @@ unfinished. Failed stream fragments are displayed by the TUI but are never
 committed. Final-answer reasoning is not written to the transcript or long-term
 Memory.
 
+While the interactive TUI stays open, a completed Turn returns to the input
+prompt instead of exiting. Core gives every new input a new `turnId` and builds
+its model Context from the completed conversation facts: prior user messages,
+assistant ToolCalls, paired Observations, and final answers. Complete thinking is
+removed from this later-Turn Context, while ToolCalls and Observations remain as
+execution evidence. If a later Turn is interrupted, transcript folding rebuilds
+those completed facts before the unfinished Turn so recovery does not lose the
+earlier evidence.
+
 Every JSONL record must end with a newline and be synced before it is considered
 committed. On open, an incomplete tail is truncated to the last newline; invalid
 JSON in an earlier committed record makes the Session fail closed. If
@@ -144,9 +153,9 @@ redelivered with its original operation identity to the durable Edit journal,
 and Bash or any unclassified tool is never re-executed: Core records a
 `recovery_unknown_outcome` Observation instead. Recovery then continues the
 same loop and durably appends its terminal result. The CLI can explicitly open
-the exact Session named by `--continue`; it does not automatically select a
-recent Session, build later-Turn Context, compact history, list Sessions, or
-garbage-collect data.
+the exact unfinished Session named by `--continue`. It does not yet reopen a
+finished Session in a new process, automatically select a recent Session,
+compact history, list Sessions, or garbage-collect data.
 
 Every new or resumed CLI run holds one exclusive `.run.lock` in that Session's
 private directory from the pre-fold read through the terminal write. A competing
@@ -542,13 +551,13 @@ importing Kimi's complete Session/Wire stack.
   leftovers. It may still access files, processes, or networks available to the
   current user and may leave side effects before timeout or cancellation; this
   is not an OS sandbox and an unknown outcome is never automatically retried.
-- Arbitrary overwrite, multi-file Edit, MCP, plugins, automatic multi-Turn
-  Session resume, long-term Memory, multi-agent behavior, background task
-  management, and a complex TUI are intentionally absent.
+- Arbitrary overwrite, multi-file Edit, MCP, plugins, reopening a finished
+  Session from a fresh process, long-term Memory, multi-agent behavior,
+  background task management, and a complex TUI are intentionally absent.
 
 ## Status
 
-On 2026-09-02, the deterministic suite passed 143 tests across 19 test files. The
+On 2026-09-02, the deterministic suite passed 146 tests across 19 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -574,6 +583,12 @@ stale changes during approval, atomic replacement, permission preservation,
 post-write verification, TUI diff display, the complete Core loop, stable
 operation identities, restart reconciliation, duplicate delivery, cancelled
 tombstones, and conflict fail-closed behavior.
+
+Multi-Turn tests run two real TUI inputs through one private Session and prove
+that the second model request receives the first Turn's user message, ToolCall,
+Read Observation, and final answer without completed thinking. A separate fold
+test interrupts the second Turn and rebuilds the same completed evidence from
+the transcript before recovery.
 
 A compiled-CLI recovery smoke opens an explicitly selected unfinished Session
 in a fresh Node process while a second compiled CLI competes for the same ID.
@@ -606,9 +621,11 @@ retained `step 1 thinking › ...` in the visible trajectory, and displayed
 
 This proves the current minimum chain, deterministic Edit side-effect recovery,
 durable Session write-ahead ordering, and explicit same-Turn continuation from a
-fresh CLI process with one active writer. It does not yet prove automatic
-latest-Session selection, later-Turn Context projection, power-loss durability
-at every write boundary, hostile-process resistance for the cooperative lock, a
+fresh CLI process with one active writer. It also proves later-Turn Context while
+the same interactive TUI remains open and after folding an interrupted second
+Turn. It does not yet prove automatic latest-Session selection, reopening a
+finished Session from a fresh process, power-loss durability at every write
+boundary, hostile-process resistance for the cooperative lock, a
 hostile-workspace sandbox, or the later complete production milestone.
 
 ## License

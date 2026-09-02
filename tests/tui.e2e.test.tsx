@@ -126,6 +126,118 @@ it("renders the complete Read trajectory and final answer in the TUI", async () 
   view.unmount();
 });
 
+it("accepts a second task in the same interactive Session", async () => {
+  const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-multi-turn-"));
+  temporaryRoots.push(root);
+  const workspace = join(root, "workspace");
+  await mkdir(workspace);
+  await writeFile(join(workspace, "README.md"), "License: MIT\n", "utf8");
+  const session = await SessionTranscriptStore.create({
+    workspaceRoot: workspace,
+    root: join(root, "sessions"),
+    sessionId: "interactive-session",
+  });
+
+  const provider = new StreamingScriptedProvider([
+    {
+      kind: "tool_calls",
+      content: [{ type: "think", think: "PRIVATE_TUI_REASONING" }],
+      calls: [
+        {
+          id: "call-tui-first-turn",
+          name: "read",
+          rawArguments: JSON.stringify({ path: "README.md" }),
+        },
+      ],
+    },
+    {
+      kind: "final",
+      content: [{ type: "text", text: "README inspected." }],
+    },
+    {
+      kind: "final",
+      content: [{ type: "text", text: "The license is MIT." }],
+    },
+  ]);
+  const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+  const core = new AgentCore(provider, runtime, { session, maxSteps: 4 });
+  const results: RunResult[] = [];
+  let finishFirst: () => void = () => undefined;
+  let finishSecond: () => void = () => undefined;
+  const firstCompletion = new Promise<void>((resolve) => {
+    finishFirst = resolve;
+  });
+  const secondCompletion = new Promise<void>((resolve) => {
+    finishSecond = resolve;
+  });
+  const view = render(
+    <AgentApp
+      core={core}
+      workspace={workspace}
+      sessionId={session.sessionId}
+      onComplete={(result) => {
+        results.push(result);
+        if (results.length === 1) {
+          finishFirst();
+        } else if (results.length === 2) {
+          finishSecond();
+        }
+      }}
+    />,
+  );
+
+  await waitForFrame(view, "task ›");
+  view.stdin.write("读取 README.md 并总结");
+  await renderTurn();
+  view.stdin.write("\r");
+  await firstCompletion;
+  await waitForFrame(view, "task ›");
+  expect(view.lastFrame()).toContain("README inspected.");
+  expect(view.lastFrame()).toContain("task ›");
+
+  view.stdin.write("它的许可证是什么？");
+  await renderTurn();
+  view.stdin.write("\r");
+  await secondCompletion;
+  await waitForFrame(view, "task ›");
+  expect(view.lastFrame()).toContain("The license is MIT.");
+
+  expect(results).toHaveLength(2);
+  expect(results[1]).toMatchObject({
+    kind: "final_answer",
+    answer: "The license is MIT.",
+  });
+  expect(provider.requests).toHaveLength(3);
+  expect(JSON.stringify(provider.requests[2])).toContain("License: MIT");
+  expect(JSON.stringify(provider.requests[2])).not.toContain(
+    "PRIVATE_TUI_REASONING",
+  );
+  const transcript = await session.load();
+  expect(transcript.map((event) => event.type)).toEqual([
+    "session_started",
+    "turn_started",
+    "tool_intent",
+    "tool_observation",
+    "turn_finished",
+    "turn_started",
+    "turn_finished",
+  ]);
+  expect(
+    transcript
+      .filter((event) => event.type === "turn_started")
+      .map((event) => event.turnId),
+  ).toHaveLength(2);
+  expect(
+    new Set(
+      transcript
+        .filter((event) => event.type === "turn_started")
+        .map((event) => event.turnId),
+    ).size,
+  ).toBe(2);
+  expect(view.lastFrame()).toContain("task ›");
+  view.unmount();
+});
+
 it("auto-starts a selected unfinished Session through Core resume", async () => {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-resume-"));
   temporaryRoots.push(root);

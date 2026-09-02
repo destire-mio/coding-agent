@@ -163,6 +163,10 @@ export function AgentApp({
 
       setRunning(true);
       setCancelling(false);
+      setResult(undefined);
+      if (request.kind === "new") {
+        setPrompt("");
+      }
       setEvents([]);
       setCompletedThinking([]);
       clearStreamingOutput();
@@ -280,10 +284,13 @@ export function AgentApp({
   }, [initialPrompt, resumeState, start]);
 
   useEffect(() => {
-    if (result !== undefined) {
+    if (
+      result !== undefined &&
+      (initialPrompt !== undefined || resumeState !== undefined)
+    ) {
       exit();
     }
-  }, [exit, result]);
+  }, [exit, initialPrompt, result, resumeState]);
 
   useEffect(
     () => () => {
@@ -311,7 +318,6 @@ export function AgentApp({
       ) : null}
 
       {!running &&
-      result === undefined &&
       initialPrompt === undefined &&
       resumeState === undefined ? (
         <Box marginTop={1}>

@@ -15,7 +15,7 @@ import type {
   ToolCall,
   ToolExecutor,
 } from "./contracts.js";
-import { assistantText } from "./contracts.js";
+import { assistantText, projectCompletedContext } from "./contracts.js";
 import {
   INITIAL_AGENT_RUN_STATE,
   isAgentRunActive,
@@ -81,6 +81,7 @@ export class AgentCore {
   readonly #session: SessionEventWriter | undefined;
   #runState: AgentRunState = INITIAL_AGENT_RUN_STATE;
   #activeController: AbortController | undefined;
+  #contextMessages: AgentMessage[] = [];
 
   constructor(
     provider: ModelProvider,
@@ -121,7 +122,7 @@ export class AgentCore {
     this.#requireNoActiveRun();
 
     const prompt = userInput.trim();
-    const messages: AgentMessage[] = [];
+    const messages = [...this.#contextMessages];
 
     if (prompt.length === 0) {
       const result = this.#failed(
@@ -136,7 +137,7 @@ export class AgentCore {
 
     const turnId = randomUUID();
     return this.#executeTurn(turnId, options, (activeOptions) =>
-      this.#runLoop(prompt, turnId, activeOptions),
+      this.#runLoop(messages, prompt, turnId, activeOptions),
     );
   }
 
@@ -216,6 +217,9 @@ export class AgentCore {
           : { requestApproval: options.requestApproval }),
       });
       result = await this.#persistTurnOutcome(turnId, result);
+      if (result.kind === "final_answer") {
+        this.#contextMessages = projectCompletedContext(result.messages);
+      }
       this.#emitTerminal(options.onEvent, result);
       this.#transition({ type: "settle", outcome: runOutcome(result) });
       return result;
@@ -231,11 +235,11 @@ export class AgentCore {
   }
 
   async #runLoop(
+    messages: AgentMessage[],
     prompt: string,
     turnId: string,
     options: RunOptions,
   ): Promise<RunResult> {
-    const messages: AgentMessage[] = [];
     messages.push({ role: "user", content: prompt });
     if (
       !(await this.#persistSessionEvent({
@@ -250,7 +254,7 @@ export class AgentCore {
       messages,
       turnId,
       1,
-      new Set<string>(),
+      collectToolCallIds(messages),
       options,
     );
   }
