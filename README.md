@@ -630,6 +630,30 @@ idle and makes zero Provider calls until the user submits new input.
 Run these deterministic fresh-process checks with `npm run smoke:session-resume`.
 They use a local OpenAI-compatible SSE server, not a paid model request.
 
+Run `npm run smoke:session-tools` for the missing-Observation crash window.
+Four compiled CLI processes execute real Read, Grep, Edit, and Bash tools. A
+test-only Node preload isolates all private stores in temporary directories,
+approves only fixed test operations, and pauses after Runtime returns but before
+Core receives the result. The smoke confirms the durable transcript still ends
+at Tool Intent, kills each process with `SIGKILL`, waits for the real lease to
+expire, and starts four new compiled `--continue` processes. No recovery policy
+or transcript event is mocked; the initial approvals are fixtures, not keyboard
+interaction tests.
+
+- Read/Grep see a marker changed after the old process died, proving a fresh read.
+- Applied Edit returns the original success with the same operation identity,
+  no available approval handler, and unchanged file content, inode, mtime, and
+  durable operation record.
+- Bash has already appended one line before the crash. Recovery never calls
+  Runtime for Bash, keeps exactly that one line, and sends the model a
+  non-retryable `recovery_unknown_outcome` Observation.
+- Every case preserves the transcript prefix and original Turn ID, appends one
+  paired Observation and one terminal event, and delivers that exact Observation
+  to the local SSE Provider before durably completing.
+
+This is a repeatable process-death test at the post-tool/pre-Observation window,
+not a DeepSeek request or proof of power-loss durability at every Edit write.
+
 The real-provider Read, Grep, Bash, and Edit smokes passed with DeepSeek Thinking. Read
 reconstructed two bounded pages; Grep followed two live result pages, found the
 safe marker, and did not expose the `.env` marker. Both streamed reasoning,
@@ -653,9 +677,9 @@ This proves the current minimum chain, deterministic Edit side-effect recovery,
 durable Session write-ahead ordering, and explicit same-Turn continuation from a
 fresh CLI process with one active writer. It also proves later-Turn Context while
 the same interactive TUI remains open and after folding an interrupted second
-Turn, plus explicit reopening of a finished Session from a fresh process. It
-does not yet prove automatic latest-Session selection, power-loss durability at
-every write
+Turn, plus explicit reopening of a finished Session from a fresh process and
+four-tool recovery after `SIGKILL` before Observation persistence. It does not yet
+prove automatic latest-Session selection, power-loss durability at every write
 boundary, hostile-process resistance for the cooperative lock, a
 hostile-workspace sandbox, or the later complete production milestone.
 

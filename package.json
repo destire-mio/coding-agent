@@ -19,6 +19,7 @@
     "smoke:bash": "tsx scripts/real-bash-smoke.ts",
     "smoke:edit": "tsx scripts/real-edit-smoke.ts",
     "smoke:session-resume": "npm run build && tsx scripts/session-resume-smoke.ts",
+    "smoke:session-tools": "npm run build && tsx scripts/session-tool-recovery-smoke.ts",
     "verify": "npm run typecheck && npm run test:run && npm run build"
   },
   "repository": {
