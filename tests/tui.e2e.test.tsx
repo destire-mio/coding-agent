@@ -4,6 +4,7 @@ import { join } from "node:path";
 import process from "node:process";
 import { afterEach, expect, it } from "vitest";
 import { render } from "ink-testing-library";
+import { act } from "react";
 
 import { AgentCore } from "../src/core/agent-core.js";
 import type {
@@ -191,17 +192,23 @@ it("accepts a second task in the same interactive Session", async () => {
 
   await waitForFrame(view, "task ›");
   view.stdin.write("读取 README.md 并总结");
-  await renderTurn();
+  await waitForFrame(view, "读取 README.md 并总结");
   view.stdin.write("\r");
-  await firstCompletion;
+  // onComplete can resolve before React mounts the next TextInput listener.
+  // Flush that transition before sending the next task to the test terminal.
+  await act(async () => {
+    await firstCompletion;
+  });
   await waitForFrame(view, "task ›");
   expect(view.lastFrame()).toContain("README inspected.");
   expect(view.lastFrame()).toContain("task ›");
 
   view.stdin.write("它的许可证是什么？");
-  await renderTurn();
+  await waitForFrame(view, "它的许可证是什么？");
   view.stdin.write("\r");
-  await secondCompletion;
+  await act(async () => {
+    await secondCompletion;
+  });
   await waitForFrame(view, "task ›");
   expect(view.lastFrame()).toContain("The license is MIT.");
 

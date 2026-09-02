@@ -3,7 +3,7 @@
 A build-to-learn Coding Agent project aiming for a runnable, explainable,
 testable, production-grade v1.
 
-## Current milestone: workspace ReAct loop, Bash, and exact Edit
+## Current milestone: workspace ReAct loop, tools, and Session recovery
 
 The first vertical slice is implemented around one real task:
 
@@ -622,7 +622,10 @@ Multi-Turn tests run two real TUI inputs through one private Session and prove
 that the second model request receives the first Turn's user message, ToolCall,
 Read Observation, and final answer without completed thinking. A separate fold
 test interrupts the second Turn and rebuilds the same completed evidence from
-the transcript before recovery.
+the transcript before recovery. The interactive test flushes React's input
+remount before the next task and waits for typed text before submitting; it
+passed 20 consecutive runs during Session closeout. This was a test-timing fix,
+not a change to Core, Runtime, or the production TUI.
 
 A compiled-CLI recovery smoke opens an explicitly selected unfinished Session
 in a fresh Node process while a second compiled CLI competes for the same ID.
