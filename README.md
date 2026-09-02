@@ -1,3 +1,5 @@
+### 里面的内容完全由ai 完成 具体学习记录 和我的output应该会开源一个md文件夹出来 （todo中
+
 # coding-agent
 
 A build-to-learn Coding Agent project aiming for a runnable, explainable,
