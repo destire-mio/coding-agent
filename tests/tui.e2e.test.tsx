@@ -19,7 +19,10 @@ import { BashTool, type BashResult } from "../src/runtime/bash-tool.js";
 import { ToolOutputStore } from "../src/runtime/tool-output-store.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import { foldSessionTranscript } from "../src/session/session-transcript-fold.js";
-import { SessionTranscriptStore } from "../src/session/session-transcript-store.js";
+import {
+  SessionTranscriptStore,
+  type SessionEventWriter,
+} from "../src/session/session-transcript-store.js";
 import type {
   RuntimeTool,
   ToolApprovalPreparation,
@@ -237,6 +240,67 @@ it("accepts a second task in the same interactive Session", async () => {
   expect(view.lastFrame()).toContain("task ›");
   view.unmount();
 });
+
+it.each(["before", "after"] as const)(
+  "blocks interactive input when terminal persistence fails %s append",
+  async (timing) => {
+    const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-persist-failure-"));
+    temporaryRoots.push(root);
+    const workspace = join(root, "workspace");
+    await mkdir(workspace);
+    const session = await SessionTranscriptStore.create({
+      workspaceRoot: workspace, root: join(root, "sessions"),
+      sessionId: "tui-persist-failure",
+    });
+    let failOnce = true;
+    const writer: SessionEventWriter = {
+      sessionId: session.sessionId,
+      async append(event) {
+        const fail = failOnce && event.type === "turn_finished";
+        if (fail) failOnce = false;
+        if (fail && timing === "before") throw new Error("injected write failure");
+        await session.append(event);
+        if (fail && timing === "after") throw new Error("injected acknowledgement failure");
+      },
+    };
+    const provider = new StreamingScriptedProvider([
+      { kind: "final", content: [{ type: "text", text: "First answer" }] },
+      { kind: "final", content: [{ type: "text", text: "Must not run" }] },
+    ]);
+    const runtime = await ToolRuntime.readOnly({ workspaceRoot: workspace });
+    const core = new AgentCore(provider, runtime, { session: writer });
+    const results: RunResult[] = [];
+    const view = render(
+      <AgentApp core={core} workspace={workspace} sessionId={session.sessionId}
+        onComplete={(result) => results.push(result)} />,
+    );
+    try {
+      await waitForFrame(view, "task ›");
+      view.stdin.write("First task");
+      await waitForFrame(view, "First task");
+      view.stdin.write("\r");
+      await waitForFrame(view, "New tasks are blocked");
+      expect(results).toMatchObject([{ kind: "failed", reason: "session_persist_failed" }]);
+      expect(view.lastFrame()).not.toContain("task ›");
+      expect(view.lastFrame()).toContain("--session tui-persist-failure");
+      expect(view.lastFrame()).toContain("--continue");
+      const before = await session.load();
+
+      view.stdin.write("Second task");
+      await renderTurn();
+      view.stdin.write("\r");
+      await renderTurn(50);
+      expect(results).toHaveLength(1);
+      expect(provider.requests).toHaveLength(1);
+      expect(await session.load()).toEqual(before);
+      expect(foldSessionTranscript(before).kind).toBe(
+        timing === "before" ? "awaiting_model" : "finished",
+      );
+    } finally {
+      view.unmount();
+    }
+  },
+);
 
 it("opens a finished Session without a model request until the user submits", async () => {
   const root = await mkdtemp(join(tmpdir(), "coding-agent-tui-reopen-"));

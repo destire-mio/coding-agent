@@ -156,6 +156,7 @@ export function AgentApp({
     async (request: AgentStartRequest) => {
       if (
         running ||
+        core.requiresSessionReload ||
         (request.kind === "new" && request.input.trim().length === 0)
       ) {
         return;
@@ -318,6 +319,7 @@ export function AgentApp({
       ) : null}
 
       {!running &&
+      !core.requiresSessionReload &&
       initialPrompt === undefined &&
       resumeState === undefined ? (
         <Box marginTop={1}>
@@ -329,6 +331,18 @@ export function AgentApp({
               void start({ kind: "new", input });
             }}
           />
+        </Box>
+      ) : null}
+
+      {!running && core.requiresSessionReload ? (
+        <Box flexDirection="column" marginTop={1}>
+          <Text color="yellow">Session reload required. New tasks are blocked.</Text>
+          <Text>Fix the storage problem, then exit with Ctrl+C and reopen the same workspace.</Text>
+          {sessionId !== undefined ? (
+            <Text>
+              Reopen with --session {sessionId}. If a Turn is unfinished, follow its --continue hint.
+            </Text>
+          ) : null}
         </Box>
       ) : null}
 

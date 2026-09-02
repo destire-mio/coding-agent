@@ -84,6 +84,7 @@ export class AgentCore {
   #runState: AgentRunState = INITIAL_AGENT_RUN_STATE;
   #activeController: AbortController | undefined;
   #contextMessages: AgentMessage[] = [];
+  #requiresSessionReload = false;
 
   constructor(
     provider: ModelProvider,
@@ -115,6 +116,10 @@ export class AgentCore {
     return this.#runState;
   }
 
+  get requiresSessionReload(): boolean {
+    return this.#requiresSessionReload;
+  }
+
   cancel(): boolean {
     const controller = this.#activeController;
     if (controller === undefined || !isAgentRunActive(this.#runState)) {
@@ -130,6 +135,9 @@ export class AgentCore {
 
   async run(userInput: string, options: RunOptions = {}): Promise<RunResult> {
     this.#requireNoActiveRun();
+    if (this.#requiresSessionReload) {
+      return this.#rejectUntilSessionReload(options);
+    }
 
     const prompt = userInput.trim();
     const messages = [...this.#contextMessages];
@@ -163,6 +171,9 @@ export class AgentCore {
       throw new Error(
         "AgentCore resume requires the matching Session event writer.",
       );
+    }
+    if (this.#requiresSessionReload) {
+      return this.#rejectUntilSessionReload(options);
     }
 
     const messages = [...state.messages];
@@ -681,8 +692,14 @@ export class AgentCore {
       steps,
       messages,
       "session_persist_failed",
-      "The Agent could not persist required Session state. Any completed tool side effect remains associated with its operation ID.",
+      "The Agent could not persist required Session state. Reopen this Session before continuing. Any completed tool side effect remains associated with its operation ID.",
     );
+  }
+
+  #rejectUntilSessionReload(options: RunOptions): RunResult {
+    const result = this.#sessionFailure(0, this.#contextMessages);
+    this.#emitTerminal(options.onEvent, result);
+    return result;
   }
 
   async #persistSessionEvent(event: SessionEventInput): Promise<boolean> {
@@ -693,6 +710,9 @@ export class AgentCore {
       await this.#session.append(event);
       return true;
     } catch {
+      // The write may have partly or fully landed. This Core must not append
+      // another Turn or resume from stale state; reopen and fold disk facts.
+      this.#requiresSessionReload = true;
       return false;
     }
   }

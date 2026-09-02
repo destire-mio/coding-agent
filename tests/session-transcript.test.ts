@@ -16,10 +16,12 @@ import type {
   ModelProvider,
   ModelRequest,
   ModelResponse,
+  RunEvent,
   ToolCall,
 } from "../src/core/contracts.js";
 import { ToolRuntime } from "../src/runtime/tool-runtime.js";
 import { SessionBusyError } from "../src/session/session-run-lease.js";
+import { foldSessionTranscript } from "../src/session/session-transcript-fold.js";
 import {
   SessionTranscriptConfigurationError,
   SessionTranscriptCorruptError,
@@ -360,6 +362,122 @@ describe("Core Session ordering", () => {
       content: [{ type: "text", text: "unsaved answer" }],
       toolCalls: [],
     });
+  });
+});
+
+describe("Core admission after Session persistence failure", () => {
+  const boundaries = [
+    { type: "turn_started", before: "no_turn", after: "awaiting_model" },
+    { type: "tool_intent", before: "awaiting_model", after: "recovering_tool" },
+    { type: "tool_observation", before: "recovering_tool", after: "awaiting_model" },
+    { type: "turn_finished", before: "awaiting_model", after: "finished" },
+  ] as const;
+
+  it.each(boundaries.flatMap((boundary) =>
+    (["before", "after"] as const).map((timing) => ({ ...boundary, timing })),
+  ))("blocks stale Core calls after $type fails $timing append", async ({
+    type, timing, before, after,
+  }) => {
+    const harness = await createStore(`failed-${type}-${timing}`);
+    await writeFile(join(harness.workspace, "README.md"), "RECOVERY_MARKER\n");
+    const runtime = await ToolRuntime.readOnly({ workspaceRoot: harness.workspace });
+    const provider = new ScriptedProvider([
+      toolResponse(readCall("README.md"), "read first"),
+      finalResponse("done"),
+      finalResponse("must not start a new Turn"),
+    ]);
+    let failOnce = true;
+    let appendCalls = 0;
+    let runtimeCalls = 0;
+    const writer: SessionEventWriter = {
+      sessionId: harness.store.sessionId,
+      async append(event) {
+        appendCalls++;
+        const fail = failOnce && event.type === type;
+        if (fail) failOnce = false;
+        if (fail && timing === "before") throw new Error("injected write failure");
+        await harness.store.append(event);
+        // A rejected write does not prove that no bytes reached the file.
+        if (fail && timing === "after") throw new Error("injected acknowledgement failure");
+      },
+    };
+    const core = new AgentCore(provider, {
+      definitions: () => runtime.definitions(),
+      execute: async (call, options) => {
+        runtimeCalls++;
+        return runtime.execute(call, options);
+      },
+    }, { session: writer });
+    const lease = await harness.store.acquireRunLease();
+    try {
+      expect(await core.run("Read README.md")).toMatchObject({
+        kind: "failed", reason: "session_persist_failed",
+      });
+      const durableEvents = await harness.store.load();
+      const state = foldSessionTranscript(durableEvents);
+      expect(state.kind).toBe(timing === "before" ? before : after);
+      const previousCounts = [appendCalls, provider.requests.length, runtimeCalls];
+      const runEvents: RunEvent[] = [];
+      const rejected = await core.run("Start another task", {
+        onEvent: (event) => runEvents.push(event),
+      });
+      // The old bug appended a second turn_started here and corrupted folding.
+      expect(await harness.store.load()).toEqual(durableEvents);
+      expect(rejected).toMatchObject({
+        kind: "failed", reason: "session_persist_failed", steps: 0,
+      });
+      expect(runEvents).toMatchObject([
+        { type: "failed", reason: "session_persist_failed", steps: 0 },
+      ]);
+      if (state.kind === "awaiting_model" || state.kind === "recovering_tool") {
+        expect(await core.resume(state)).toMatchObject({
+          kind: "failed", reason: "session_persist_failed", steps: 0,
+        });
+      }
+      expect(core.requiresSessionReload).toBe(true);
+      expect([appendCalls, provider.requests.length, runtimeCalls]).toEqual(previousCounts);
+      expect(await harness.store.load()).toEqual(durableEvents);
+    } finally {
+      await lease.release();
+    }
+
+    // Reopen through the production lock/read path, then build a fresh Core.
+    // Durable state (not the failed return value) selects resume vs new Turn.
+    const reopened = await SessionTranscriptStore.openForRun({
+      workspaceRoot: harness.workspace, root: harness.storeRoot,
+      sessionId: harness.store.sessionId,
+    });
+    try {
+      const state = foldSessionTranscript(reopened.events);
+      const ready = state.kind === "no_turn" || state.kind === "finished";
+      const fresh = new AgentCore(new ScriptedProvider([finalResponse("recovered")]),
+        await ToolRuntime.readOnly({ workspaceRoot: harness.workspace }), {
+          session: reopened.session,
+          ...(ready ? { initialSession: state } : {}),
+        });
+      expect(fresh.requiresSessionReload).toBe(false);
+      const result = ready ? await fresh.run("New task") : await fresh.resume(state);
+      expect(result.kind).toBe("final_answer");
+      expect(foldSessionTranscript(await reopened.session.load()).kind).toBe("finished");
+      expect(core.requiresSessionReload).toBe(true);
+    } finally {
+      await reopened.lease.release();
+    }
+  });
+
+  it("still accepts a new Turn after an ordinary failure was durably finished", async () => {
+    const harness = await createStore("durable-normal-failure");
+    const provider = new ScriptedProvider([
+      { kind: "tool_calls", calls: [], content: [] },
+      finalResponse("next Turn succeeded"),
+    ]);
+    const core = new AgentCore(provider, noToolRuntime(), { session: harness.store });
+    expect(await core.run("Invalid model response")).toMatchObject({
+      kind: "failed", reason: "invalid_model_response",
+    });
+    expect(core.requiresSessionReload).toBe(false);
+    expect((await core.run("Try a new task")).kind).toBe("final_answer");
+    expect(foldSessionTranscript(await harness.store.load()).kind).toBe("finished");
   });
 });
 

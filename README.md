@@ -140,6 +140,17 @@ Observation cannot be persisted, the run ends as `session_persist_failed`
 without pretending the side effect did not happen. A Turn is completed only
 after its terminal record is durable.
 
+Any Session append failure also marks that Core as requiring a Session reload.
+Both `run` and `resume` then return `session_persist_failed` without calling the
+Provider, executing tools, or appending more events. The TUI removes the task
+input and shows recovery instructions. Fix the storage problem, exit, and reopen
+the same workspace with `--session <id>`; if a Turn is unfinished, the CLI directs
+you to `--continue <id>`. A fresh Core uses the existing lock-then-read path to
+select the recovery position from disk. An append can report failure even after
+the record was written, so the old Core never guesses that position or resets
+its guard in place. Ordinary failures with a durable terminal record still allow
+the next Turn.
+
 One model response may contain either no ToolCall (a final answer) or exactly one
 ToolCall. More than one is rejected with zero tool execution. A Turn can still
 perform `Read → Edit → final` across separate model responses. This milestone
@@ -575,7 +586,7 @@ importing Kimi's complete Session/Wire stack.
 
 ## Status
 
-On 2026-09-02, the deterministic suite passed 149 tests across 19 test files. The
+On 2026-09-02, the deterministic suite passed 160 tests across 19 test files. The
 suite includes an in-process OpenAI-compatible HTTP server that returns 429 then
 streams success, proving the retry is owned and surfaced by Core rather than
 hidden inside the SDK. A second real HTTP trajectory proves that
@@ -586,7 +597,12 @@ only once. Tool Runtime contract tests lock same-registry disclosure, duplicate
 registration rejection, paired unknown-tool and malformed-argument failures,
 and one-ToolCall-per-response enforcement. Session tests lock JSONL commit and
 tail-repair rules, Core write-ahead ordering, final outcome durability, and the
-two persistence-failure sides of a real Edit. A deterministic Ink TUI trajectory also
+two persistence-failure sides of a real Edit. Admission regressions inject errors
+before and after each of the four Session append boundaries: the old Core stays
+blocked, existing records are unchanged, and a freshly reopened Session can
+continue from its actual durable state. Ink tests also prove terminal-save
+failure removes interactive input and cannot create overlapping Turns.
+A deterministic Ink TUI trajectory also
 proves that Esc reaches the Core state machine, aborts the Provider signal, and
 ends as `stopped: cancelled`. A separate in-flight Read test proves that its
 completed Observation is retained while the next model request is suppressed.
